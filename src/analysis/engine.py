@@ -211,6 +211,20 @@ class TradeAnalysisEngine:
     # Market parser
     # -------------------------------------------------------------------------
 
+    # Map Kalshi series ticker prefix → city name (must match US_CITIES in weather/pipeline.py)
+    SERIES_CITY_MAP = {
+        "KXHIGHTPHX": "PHOENIX", "KXHIGHTHOU": "HOUSTON", "KXHIGHTMIN": "MINNEAPOLIS",
+        "KXHIGHTDAL": "DALLAS", "KXHIGHTLV": "LAS_VEGAS", "KXHIGHTSATX": "SAN_ANTONIO",
+        "KXHIGHTBOS": "BOSTON", "KXHIGHTNOLA": "NEW_ORLEANS", "KXHIGHTSFO": "LOS_ANGELES",
+        "KXHIGHTSEA": "SEATTLE", "KXHIGHTDC": "NYC",  # DC not in pipeline, map to nearest
+        "KXHIGHTATL": "ATLANTA", "KXHIGHTOKC": "NASHVILLE",
+        "KXLOWTCHI": "CHICAGO", "KXLOWTDEN": "DENVER", "KXLOWTNYC": "NYC",
+        "KXLOWTPHIL": "PHILADELPHIA", "KXLOWTMIA": "MIAMI", "KXLOWTLAX": "LOS_ANGELES",
+        "KXLOWTAUS": "DALLAS",
+        "KXRAINNYC": "NYC", "KXRAINHOU": "HOUSTON", "KXRAINCHIM": "CHICAGO",
+        "KXRAINSEA": "SEATTLE",
+    }
+
     def _parse_market(self, ticker: str, title: str) -> Optional[tuple]:
         """
         Attempts to extract (city, market_type, threshold) from ticker/title.
@@ -219,24 +233,35 @@ class TradeAnalysisEngine:
         ticker_upper = ticker.upper()
         title_lower = title.lower()
 
+        # First: try series prefix map (most reliable)
         city = None
-        for c in ["NYC", "LOS_ANGELES", "CHICAGO", "HOUSTON", "PHOENIX",
-                   "PHILADELPHIA", "SAN_ANTONIO", "SAN_DIEGO", "DALLAS",
-                   "MIAMI", "ATLANTA", "BOSTON", "SEATTLE", "DENVER",
-                   "MINNEAPOLIS", "NEW_ORLEANS", "LAS_VEGAS", "KANSAS_CITY",
-                   "CLEVELAND", "NASHVILLE"]:
-            if c.replace("_", "") in ticker_upper or c.replace("_", " ").lower() in title_lower:
-                city = c
+        for prefix, mapped_city in self.SERIES_CITY_MAP.items():
+            if ticker_upper.startswith(prefix):
+                city = mapped_city
                 break
-        # Common abbreviations in titles
-        city_aliases = {
-            "NEW YORK": "NYC", "LOS ANGELES": "LOS_ANGELES", "LA": "LOS_ANGELES",
-            "CHI": "CHICAGO", "ATL": "ATLANTA", "BOS": "BOSTON",
-            "SEA": "SEATTLE", "DEN": "DENVER", "MIA": "MIAMI",
-        }
+
+        # Fallback: city name in ticker or title
         if not city:
+            for c in ["NYC", "LOS_ANGELES", "CHICAGO", "HOUSTON", "PHOENIX",
+                       "PHILADELPHIA", "SAN_ANTONIO", "SAN_DIEGO", "DALLAS",
+                       "MIAMI", "ATLANTA", "BOSTON", "SEATTLE", "DENVER",
+                       "MINNEAPOLIS", "NEW_ORLEANS", "LAS_VEGAS", "KANSAS_CITY",
+                       "CLEVELAND", "NASHVILLE"]:
+                if c.replace("_", "") in ticker_upper or c.replace("_", " ").lower() in title_lower:
+                    city = c
+                    break
+        if not city:
+            city_aliases = {
+                "new york": "NYC", "los angeles": "LOS_ANGELES",
+                "chicago": "CHICAGO", "atlanta": "ATLANTA", "boston": "BOSTON",
+                "seattle": "SEATTLE", "denver": "DENVER", "miami": "MIAMI",
+                "houston": "HOUSTON", "phoenix": "PHOENIX", "dallas": "DALLAS",
+                "minneapolis": "MINNEAPOLIS", "philadelphia": "PHILADELPHIA",
+                "san antonio": "SAN_ANTONIO", "new orleans": "NEW_ORLEANS",
+                "las vegas": "LAS_VEGAS",
+            }
             for alias, mapped in city_aliases.items():
-                if alias.lower() in title_lower:
+                if alias in title_lower:
                     city = mapped
                     break
         if not city:
@@ -245,9 +270,19 @@ class TradeAnalysisEngine:
         market_type = None
         threshold = None
 
-        if any(kw in title_lower for kw in ["high temp", "high temperature", "high above", "max temp"]):
+        # Also infer from series prefix
+        series_prefix = next((p for p in self.SERIES_CITY_MAP if ticker_upper.startswith(p)), "")
+        if "HIGH" in series_prefix or "HIGHT" in series_prefix:
             market_type = "temp_high"
-        elif any(kw in title_lower for kw in ["low temp", "low temperature", "low below", "min temp"]):
+        elif "LOW" in series_prefix or "LOWT" in series_prefix:
+            market_type = "temp_low"
+        elif "RAIN" in series_prefix:
+            market_type = "rain"
+        elif "SNOW" in series_prefix:
+            market_type = "snow"
+        elif any(kw in title_lower for kw in ["high temp", "high temperature", "maximum temperature", "max temp", "maximum temp"]):
+            market_type = "temp_high"
+        elif any(kw in title_lower for kw in ["low temp", "low temperature", "lowest temperature", "minimum temp"]):
             market_type = "temp_low"
         elif any(kw in title_lower for kw in ["rain", "precipitation", "precip"]):
             market_type = "rain"
@@ -256,11 +291,20 @@ class TradeAnalysisEngine:
         else:
             return None
 
-        # Try to extract numeric threshold from title (e.g. "above 75°F")
+        # Extract threshold from ticker suffix first (e.g. -T96, -T89, -B95.5)
         import re
-        nums = re.findall(r"(\d+)", title)
-        if nums:
-            threshold = int(nums[-1])
+        ticker_thresh = re.search(r"-[TB]([\d.]+)(?:-|$)", ticker_upper)
+        if ticker_thresh:
+            threshold = int(float(ticker_thresh.group(1)))
+        else:
+            # Fall back: extract temperature number from title (°F)
+            m = re.search(r"(\d+)\s*°", title)
+            if m:
+                threshold = int(m.group(1))
+            else:
+                nums = re.findall(r"\b(\d{2,3})\b", title)
+                if nums:
+                    threshold = int(nums[0])
 
         return city, market_type, threshold
 

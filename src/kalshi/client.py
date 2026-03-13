@@ -136,30 +136,37 @@ class KalshiClient:
     # Markets
     # -------------------------------------------------------------------------
 
+    # Known Kalshi weather series tickers (high temp, low temp, rain)
+    WEATHER_SERIES = [
+        # High temperature
+        "KXHIGHTPHX", "KXHIGHTHOU", "KXHIGHTMIN", "KXHIGHTDAL", "KXHIGHTLV",
+        "KXHIGHTSATX", "KXHIGHTBOS", "KXHIGHTNOLA", "KXHIGHTSFO", "KXHIGHTSEA",
+        "KXHIGHTDC", "KXHIGHTATL", "KXHIGHTOKC",
+        # Low temperature
+        "KXLOWTCHI", "KXLOWTDEN", "KXLOWTNYC", "KXLOWTPHIL", "KXLOWTMIA",
+        "KXLOWTLAX", "KXLOWTAUS",
+        # Rain
+        "KXRAINNYC", "KXRAINHOU", "KXRAINCHIM", "KXRAINSEA",
+    ]
+
     def get_weather_markets(self) -> list[dict]:
         """
-        Returns open daily weather markets for US locations.
-        Filters for weather series and today's settlement only.
+        Returns open daily/next-day weather markets by fetching each known series.
         """
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        params = {
-            "status": "open",
-            "series_ticker": "",  # will filter by category below
-            "limit": 200,
-        }
-        data = self._get("/markets", params=params)
-        markets = data.get("markets", [])
+        today_str = datetime.now(timezone.utc).strftime("%y%b%d").upper()  # e.g. 26MAR12
 
         weather = []
-        for m in markets:
-            ticker = m.get("ticker", "")
-            category = m.get("category", "").lower()
-            event_ticker = m.get("event_ticker", "")
-            # Kalshi weather tickers typically start with WEATHER or KXHIGH/KXLOW/KXRAIN
-            if any(kw in ticker.upper() for kw in ["WEATHER", "KXHIGH", "KXLOW", "KXRAIN", "KXSNOW", "KXTEMP"]):
-                weather.append(m)
-            elif "weather" in category:
-                weather.append(m)
+        for series in self.WEATHER_SERIES:
+            try:
+                data = self._get("/markets", params={
+                    "status": "open",
+                    "series_ticker": series,
+                    "limit": 20,
+                })
+                for m in data.get("markets", []):
+                    weather.append(m)
+            except Exception:
+                continue
 
         return weather
 
@@ -184,18 +191,53 @@ class KalshiClient:
         """
         Returns a liquidity summary for a market.
         Includes available volume on yes/no sides and spread.
+
+        Kalshi returns orderbook_fp with yes_dollars/no_dollars as
+        [[price_decimal, dollars], ...] e.g. [["0.95", "100.00"], ...]
+        where price_decimal is the YES price (0.01–0.99).
         """
         ob = self.get_orderbook(ticker, depth=10)
-        yes_bids = ob.get("orderbook", {}).get("yes", [])  # [[price, size], ...]
-        no_bids = ob.get("orderbook", {}).get("no", [])
+        fp = ob.get("orderbook_fp", {})
 
-        yes_volume = sum(size for _, size in yes_bids) if yes_bids else 0
-        no_volume = sum(size for _, size in no_bids) if no_bids else 0
+        # yes_dollars: bids to buy YES at given price
+        # no_dollars: bids to buy NO at given price (NO price = 1 - YES price)
+        yes_raw = fp.get("yes_dollars", [])
+        no_raw = fp.get("no_dollars", [])
+
+        # Convert to (price_cents, dollars) tuples
+        def parse_side(raw):
+            result = []
+            for entry in raw:
+                try:
+                    price_dec = float(entry[0])
+                    dollars = float(entry[1])
+                    price_cents = round(price_dec * 100)
+                    result.append((price_cents, dollars))
+                except (IndexError, ValueError):
+                    continue
+            return result
+
+        yes_bids = parse_side(yes_raw)
+        no_bids = parse_side(no_raw)
+
+        yes_volume = sum(d for _, d in yes_bids)
+        no_volume = sum(d for _, d in no_bids)
         total_volume = yes_volume + no_volume
 
-        # Best yes price (highest bid) and best no price
+        # Best yes bid: highest price someone is willing to pay for YES
+        # Best no bid: highest price someone is willing to pay for NO
+        # For NO bids stored as NO price: best_no = max no price
+        # For YES bids stored as YES price: best_yes = max yes price
         best_yes = max((p for p, _ in yes_bids), default=None)
         best_no = max((p for p, _ in no_bids), default=None)
+
+        # Spread: how much the market maker captures (yes_ask + no_ask - 100)
+        # If only no_bids exist, best_yes_ask = 100 - best_no (complementary)
+        if best_yes is None and best_no is not None:
+            best_yes = 100 - best_no
+        if best_no is None and best_yes is not None:
+            best_no = 100 - best_yes
+
         spread = (best_yes + best_no - 100) if (best_yes and best_no) else None
 
         return {
@@ -206,7 +248,7 @@ class KalshiClient:
             "best_yes_price": best_yes,
             "best_no_price": best_no,
             "spread": spread,
-            "is_liquid": total_volume >= 50,  # minimum $0.50 in contracts (cents)
+            "is_liquid": total_volume >= 1.0,  # at least $1 in the book
         }
 
     # -------------------------------------------------------------------------

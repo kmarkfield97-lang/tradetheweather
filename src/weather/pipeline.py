@@ -63,9 +63,20 @@ class WeatherPipeline:
             resp = self.http.get(url)
             resp.raise_for_status()
             periods = resp.json()["properties"]["periods"]
-            # First two periods are today daytime + tonight
-            today = periods[0] if periods else {}
-            tonight = periods[1] if len(periods) > 1 else {}
+            # NWS periods alternate daytime/nighttime.
+            # If periods[0] is nighttime (after ~6 PM), high is in periods[1],
+            # and tonight's low is in periods[0].
+            if not periods:
+                return {"error": "no periods", "city": city}
+            p0 = periods[0]
+            p1 = periods[1] if len(periods) > 1 else {}
+            if p0.get("isDaytime"):
+                today = p0
+                tonight = p1
+            else:
+                # Already past daytime — tonight IS periods[0], tomorrow day is periods[1]
+                today = p1  # tomorrow's daytime (still useful for high)
+                tonight = p0
             return {
                 "city": city,
                 "date": date.today().isoformat(),
