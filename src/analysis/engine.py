@@ -122,7 +122,7 @@ class TradeAnalysisEngine:
         parsed = self._parse_market(ticker, title)
         if not parsed:
             return None
-        city, market_type, threshold = parsed
+        city, market_type, threshold, is_bucket = parsed
 
         # Skip markets closing within 8 hours — outcome is likely already determined.
         # Also skip same-day markets after noon local time — the high temp has already
@@ -156,7 +156,7 @@ class TradeAnalysisEngine:
 
         # Score the market
         our_prob, reasoning, forecast_summary = self._score_market(
-            market_type, threshold, report, city
+            market_type, threshold, report, city, is_bucket
         )
         if our_prob is None:
             return None
@@ -320,13 +320,14 @@ class TradeAnalysisEngine:
         else:
             return None
 
-        # Extract threshold from ticker suffix first (e.g. -T96, -T89, -B95.5)
+        # Extract threshold and market subtype (T=above/below, B=bucket range)
         import re
-        ticker_thresh = re.search(r"-[TB]([\d.]+)(?:-|$)", ticker_upper)
+        is_bucket = False
+        ticker_thresh = re.search(r"-([TB])([\d.]+)(?:-|$)", ticker_upper)
         if ticker_thresh:
-            threshold = int(float(ticker_thresh.group(1)))
+            is_bucket = (ticker_thresh.group(1) == "B")
+            threshold = int(float(ticker_thresh.group(2)))
         else:
-            # Fall back: extract temperature number from title (°F)
             m = re.search(r"(\d+)\s*°", title)
             if m:
                 threshold = int(m.group(1))
@@ -335,14 +336,15 @@ class TradeAnalysisEngine:
                 if nums:
                     threshold = int(nums[0])
 
-        return city, market_type, threshold
+        return city, market_type, threshold, is_bucket
 
     # -------------------------------------------------------------------------
     # Scoring
     # -------------------------------------------------------------------------
 
     def _score_market(
-        self, market_type: str, threshold: Optional[int], report: dict, city: str = ""
+        self, market_type: str, threshold: Optional[int], report: dict,
+        city: str = "", is_bucket: bool = False
     ) -> tuple[Optional[float], str, str]:
         """
         Returns (probability, reasoning, forecast_summary).
@@ -363,41 +365,59 @@ class TradeAnalysisEngine:
 
         forecast_summary = f"{short_fc} | High: {high_temp}°F Low: {low_temp}°F | Precip: {precip_chance}%"
 
+        # Forecast uncertainty: NWS 2-day forecasts have ~7°F std dev.
+        # Use a wider uncertainty so the sigmoid doesn't saturate on large diffs.
+        UNCERTAINTY_F = 7.0  # degrees F — realistic 2-day forecast spread
+
         if market_type == "temp_high" and threshold is not None and high_temp is not None:
-            # Apply warm-bias correction: NWS consistently runs too warm for most cities.
-            # Subtract the city's recent mean forecast error before computing probability.
-            warm_bias = self._get_warm_bias(city, "temp_high") if city else 0.0
-            corrected_high = high_temp - warm_bias
-            diff = corrected_high - threshold
-            # Logistic curve: sigmoid of difference scaled by uncertainty
-            uncertainty = 3.0  # degrees F spread
-            trend_adj = (temp_trend or 0) * 2  # warming trend nudges up
-            adjusted_diff = diff + trend_adj
-            prob = self._sigmoid(adjusted_diff / uncertainty)
-            bias_note = f" [bias-corrected: {high_temp}°F - {warm_bias:+.1f}°F bias = {corrected_high:.1f}°F]" if warm_bias != 0.0 else ""
+            # Bias correction disabled — historical data is corrupted by duplicate writes.
+            # Use NWS forecast directly with wider uncertainty to account for this.
+            warm_bias = 0.0
+            corrected_high = high_temp
+            trend_adj = (temp_trend or 0) * 2
+            corrected_high += trend_adj
+
+            if is_bucket:
+                # Bucket market: YES if temp lands in [threshold, threshold+2)
+                # P = CDF(threshold+2) - CDF(threshold) under our forecast distribution
+                p_above_lo = self._sigmoid((corrected_high - threshold) / UNCERTAINTY_F)
+                p_above_hi = self._sigmoid((corrected_high - (threshold + 2)) / UNCERTAINTY_F)
+                prob = p_above_lo - p_above_hi
+            else:
+                # Threshold market: YES if temp > threshold (T-suffix = above) or < threshold (check title)
+                diff = corrected_high - threshold
+                prob = self._sigmoid(diff / UNCERTAINTY_F)
+
+            bias_note = f" (NWS bias-corrected by {warm_bias:+.1f}°F → {corrected_high:.0f}°F)" if warm_bias != 0.0 else ""
             reasoning = (
-                f"NWS forecasts high of {high_temp}°F vs market threshold of {threshold}°F "
-                f"(diff: {diff:+.1f}°F){bias_note}. "
-                f"Temp trend: {'warming' if (temp_trend or 0) > 0 else 'cooling'} "
-                f"({temp_trend:+.2f}°F/hr). Moon: {moon['phase_name']}."
+                f"NWS high {high_temp}°F vs threshold {threshold}°F "
+                f"(gap: {corrected_high - threshold:+.0f}°F){bias_note}. "
+                f"{'Bucket market. ' if is_bucket else ''}"
+                f"Uncertainty: ±{UNCERTAINTY_F}°F. Trend: {temp_trend:+.2f}°F/hr."
             )
             return prob, reasoning, forecast_summary
 
         elif market_type == "temp_low" and threshold is not None and low_temp is not None:
-            # Apply warm-bias correction to low temp too (inverted: warm bias raises lows)
-            warm_bias = self._get_warm_bias(city, "temp_low") if city else 0.0
-            corrected_low = low_temp - warm_bias
-            diff = corrected_low - threshold
-            uncertainty = 3.0
+            # Bias correction disabled — historical data is corrupted by duplicate writes.
+            warm_bias = 0.0
+            corrected_low = low_temp
             trend_adj = (temp_trend or 0) * 2
-            adjusted_diff = diff + trend_adj
-            prob = self._sigmoid(adjusted_diff / uncertainty)
-            bias_note = f" [bias-corrected: {low_temp}°F - {warm_bias:+.1f}°F bias = {corrected_low:.1f}°F]" if warm_bias != 0.0 else ""
+            corrected_low += trend_adj
+
+            if is_bucket:
+                p_above_lo = self._sigmoid((corrected_low - threshold) / UNCERTAINTY_F)
+                p_above_hi = self._sigmoid((corrected_low - (threshold + 2)) / UNCERTAINTY_F)
+                prob = p_above_lo - p_above_hi
+            else:
+                diff = corrected_low - threshold
+                prob = self._sigmoid(diff / UNCERTAINTY_F)
+
+            bias_note = f" (NWS bias-corrected by {warm_bias:+.1f}°F → {corrected_low:.0f}°F)" if warm_bias != 0.0 else ""
             reasoning = (
-                f"NWS forecasts low of {low_temp}°F vs market threshold of {threshold}°F "
-                f"(diff: {diff:+.1f}°F){bias_note}. "
-                f"Temp trend: {'warming' if (temp_trend or 0) > 0 else 'cooling'} "
-                f"({temp_trend:+.2f}°F/hr). Moon: {moon['phase_name']}."
+                f"NWS low {low_temp}°F vs threshold {threshold}°F "
+                f"(gap: {corrected_low - threshold:+.0f}°F){bias_note}. "
+                f"{'Bucket market. ' if is_bucket else ''}"
+                f"Uncertainty: ±{UNCERTAINTY_F}°F. Trend: {temp_trend:+.2f}°F/hr."
             )
             return prob, reasoning, forecast_summary
 

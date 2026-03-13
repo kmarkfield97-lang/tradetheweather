@@ -367,6 +367,10 @@ class Orchestrator:
         errors = data.get("forecast_errors", [])
         calibration = data.get("calibration", {})
 
+        # Deduplicate: remove any existing entries for today to avoid double-writing
+        today_iso = date.today().isoformat()
+        errors = [e for e in errors if e.get("date") != today_iso]
+
         http = httpx.Client(
             timeout=15.0,
             headers={"User-Agent": "TradeTheWeather/1.0 contact@tradetheweather.local"},
@@ -414,7 +418,7 @@ class Orchestrator:
                     error = forecast_high - actual_high   # positive = ran too warm
                     record = {
                         "city": city,
-                        "date": yesterday,
+                        "date": today_iso,
                         "market_type": "temp_high",
                         "forecast_value": forecast_high,
                         "actual_value": actual_high,
@@ -433,7 +437,7 @@ class Orchestrator:
                     error = forecast_low - actual_low
                     record = {
                         "city": city,
-                        "date": yesterday,
+                        "date": today_iso,
                         "market_type": "temp_low",
                         "forecast_value": forecast_low,
                         "actual_value": actual_low,
