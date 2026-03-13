@@ -266,6 +266,7 @@ class KalshiClient:
         order_type: str = "limit",
     ) -> dict:
         """Places a limit order. Returns order details."""
+        # Kalshi requires exactly one of yes_price or no_price
         body = {
             "ticker": ticker,
             "action": "buy",
@@ -273,7 +274,6 @@ class KalshiClient:
             "count": count,
             "type": order_type,
             "yes_price": price if side == "yes" else 100 - price,
-            "no_price": price if side == "no" else 100 - price,
         }
         return self._post("/portfolio/orders", body)
 
