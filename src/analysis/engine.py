@@ -18,9 +18,10 @@ MIN_EDGE = 0.07        # 7 cents edge over implied probability
 MIN_LIQUIDITY = 50     # minimum total contracts in orderbook
 MAX_SPREAD = 15        # maximum acceptable spread (cents)
 MAX_TRADES_PER_DAY = 5
-MAX_POSITION_PCT = 0.20  # 20% of daily budget per trade
-MIN_PRICE_CENTS = 10   # skip markets priced below 10¢ — too close to settlement
-MIN_HOURS_TO_CLOSE = 4 # skip markets closing in less than 4 hours
+MAX_POSITION_PCT = 0.10  # 10% of daily budget per trade (was 20%, halved for safety)
+MIN_PRICE_CENTS = 15   # skip markets priced below 15¢ — too close to settlement
+MIN_HOURS_TO_CLOSE = 8 # skip markets closing in less than 8 hours
+MAX_DOLLARS_PER_TRADE = 5.0  # hard cap: never risk more than $5 on one trade
 
 
 @dataclass
@@ -123,13 +124,20 @@ class TradeAnalysisEngine:
             return None
         city, market_type, threshold = parsed
 
-        # Skip markets closing within 4 hours — price already reflects outcome
+        # Skip markets closing within 8 hours — outcome is likely already determined.
+        # Also skip same-day markets after noon local time — the high temp has already
+        # been set and we'd be using tomorrow's NWS forecast, not today's actuals.
         close_time = market.get("close_time") or market.get("expiration_time")
         if close_time:
             try:
                 ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-                hours_left = (ct - datetime.now(timezone.utc)).total_seconds() / 3600
+                now_utc = datetime.now(timezone.utc)
+                hours_left = (ct - now_utc).total_seconds() / 3600
                 if hours_left < MIN_HOURS_TO_CLOSE:
+                    return None
+                # If market settles today (UTC date matches), skip after 18:00 UTC (noon PT / 1 PM MT)
+                # because today's high temp has already occurred
+                if ct.date() == now_utc.date() and now_utc.hour >= 18:
                     return None
             except Exception:
                 pass
@@ -187,15 +195,19 @@ class TradeAnalysisEngine:
         kelly = (prob_win * odds - prob_lose) / odds
         fractional_kelly = kelly * 0.25  # use 1/4 Kelly for safety
 
-        max_position = daily_budget * MAX_POSITION_PCT
+        max_position = min(daily_budget * MAX_POSITION_PCT, MAX_DOLLARS_PER_TRADE)
         position_dollars = min(daily_budget * fractional_kelly, max_position)
-        position_dollars = max(1.0, round(position_dollars, 2))  # minimum $1
+        position_dollars = max(0.50, round(position_dollars, 2))  # minimum $0.50
 
         contracts = math.floor(position_dollars / (price / 100))
         if contracts < 1:
             return None
 
+        # Hard safety cap: never place more than MAX_DOLLARS_PER_TRADE
         actual_cost = contracts * (price / 100)
+        if actual_cost > MAX_DOLLARS_PER_TRADE:
+            contracts = math.floor(MAX_DOLLARS_PER_TRADE / (price / 100))
+            actual_cost = contracts * (price / 100)
 
         # Confidence tier
         if edge >= 0.15:
@@ -232,12 +244,12 @@ class TradeAnalysisEngine:
     SERIES_CITY_MAP = {
         "KXHIGHTPHX": "PHOENIX", "KXHIGHTHOU": "HOUSTON", "KXHIGHTMIN": "MINNEAPOLIS",
         "KXHIGHTDAL": "DALLAS", "KXHIGHTLV": "LAS_VEGAS", "KXHIGHTSATX": "SAN_ANTONIO",
-        "KXHIGHTBOS": "BOSTON", "KXHIGHTNOLA": "NEW_ORLEANS", "KXHIGHTSFO": "LOS_ANGELES",
-        "KXHIGHTSEA": "SEATTLE", "KXHIGHTDC": "NYC",  # DC not in pipeline, map to nearest
-        "KXHIGHTATL": "ATLANTA", "KXHIGHTOKC": "NASHVILLE",
+        "KXHIGHTBOS": "BOSTON", "KXHIGHTNOLA": "NEW_ORLEANS", "KXHIGHTSFO": "SAN_FRANCISCO",
+        "KXHIGHTSEA": "SEATTLE", "KXHIGHTDC": "DC",
+        "KXHIGHTATL": "ATLANTA", "KXHIGHTOKC": "OKLAHOMA_CITY",
         "KXLOWTCHI": "CHICAGO", "KXLOWTDEN": "DENVER", "KXLOWTNYC": "NYC",
         "KXLOWTPHIL": "PHILADELPHIA", "KXLOWTMIA": "MIAMI", "KXLOWTLAX": "LOS_ANGELES",
-        "KXLOWTAUS": "DALLAS",
+        "KXLOWTAUS": "AUSTIN",
         "KXRAINNYC": "NYC", "KXRAINHOU": "HOUSTON", "KXRAINCHIM": "CHICAGO",
         "KXRAINSEA": "SEATTLE",
     }
