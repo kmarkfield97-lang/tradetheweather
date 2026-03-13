@@ -78,7 +78,9 @@ class KalshiClient:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
         ts = str(int(time.time() * 1000))
-        msg = (ts + method.upper() + path).encode("utf-8")
+        # Signature must include the full path: /trade-api/v2/...
+        full_path = "/trade-api/v2" + path
+        msg = (ts + method.upper() + full_path).encode("utf-8")
         sig = self._private_key.sign(
             msg,
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
