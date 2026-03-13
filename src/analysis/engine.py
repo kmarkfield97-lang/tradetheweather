@@ -19,6 +19,8 @@ MIN_LIQUIDITY = 50     # minimum total contracts in orderbook
 MAX_SPREAD = 15        # maximum acceptable spread (cents)
 MAX_TRADES_PER_DAY = 5
 MAX_POSITION_PCT = 0.20  # 20% of daily budget per trade
+MIN_PRICE_CENTS = 10   # skip markets priced below 10¢ — too close to settlement
+MIN_HOURS_TO_CLOSE = 4 # skip markets closing in less than 4 hours
 
 
 @dataclass
@@ -121,6 +123,17 @@ class TradeAnalysisEngine:
             return None
         city, market_type, threshold = parsed
 
+        # Skip markets closing within 4 hours — price already reflects outcome
+        close_time = market.get("close_time") or market.get("expiration_time")
+        if close_time:
+            try:
+                ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                hours_left = (ct - datetime.now(timezone.utc)).total_seconds() / 3600
+                if hours_left < MIN_HOURS_TO_CLOSE:
+                    return None
+            except Exception:
+                pass
+
         # Check liquidity first — skip illiquid markets immediately
         liquidity = self.kalshi.get_liquidity(ticker)
         if not liquidity["is_liquid"]:
@@ -162,6 +175,10 @@ class TradeAnalysisEngine:
             price = no_price
         else:
             return None  # no edge
+
+        # Skip near-certain markets (< 10¢) — price reflects known outcome, no real edge
+        if price < MIN_PRICE_CENTS:
+            return None
 
         # Kelly criterion (fractional) for position sizing
         prob_win = our_prob if side == "yes" else (1 - our_prob)
