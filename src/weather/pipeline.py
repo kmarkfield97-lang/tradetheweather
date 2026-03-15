@@ -265,11 +265,13 @@ class WeatherPipeline:
         moon = self.get_moon_phase()
         observations = self.get_recent_observations(city, hours=24)
 
-        # Compute temperature trend from recent observations
-        temps = [o["temp_f"] for o in observations if o["temp_f"] is not None]
+        # Compute temperature trend from recent observations.
+        # NWS returns observations newest-first; reverse so index 0 = oldest
+        # so a positive slope correctly means warming over time.
+        temps_newest_first = [o["temp_f"] for o in observations if o["temp_f"] is not None]
         temp_trend = None
-        if len(temps) >= 3:
-            # Simple linear slope: positive = warming, negative = cooling
+        if len(temps_newest_first) >= 3:
+            temps = list(reversed(temps_newest_first))  # oldest → newest
             n = len(temps)
             xs = list(range(n))
             mean_x = sum(xs) / n
