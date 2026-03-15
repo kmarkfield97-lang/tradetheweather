@@ -20,8 +20,8 @@ from src.tracker.history import DailyHistoryTracker
 
 logger = logging.getLogger(__name__)
 
-SCAN_INTERVAL_MINUTES = 30
-MAX_TRADES_PER_DAY = 10   # defined here; enforcement is via can_trade() / trading_halted
+SCAN_INTERVAL_MINUTES = 10
+MAX_TRADES_PER_DAY = 999999  # unlimited — cash reserve enforces the real limit
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "../data")
 
@@ -58,12 +58,14 @@ class Orchestrator:
         self.kalshi = KalshiClient()
         self.weather = WeatherPipeline()
         self.analysis = TradeAnalysisEngine(self.kalshi, self.weather)
-        self.tracker = PnLTracker(self.kalshi)
+        self.tracker = PnLTracker(self.kalshi, self.weather)
         self.history = DailyHistoryTracker()
         self.scheduler = AsyncIOScheduler()
         self.bot = None
         self._known_resting_ids: set = set()
         self._bot_exit_order_ids: set = set()
+        # Maps exit order_id -> (position, exit_price_cents, contracts_to_exit)
+        self._pending_exits: dict = {}
         self.started_at = datetime.now(timezone.utc)
 
     def set_bot(self, bot):
@@ -147,16 +149,6 @@ class Orchestrator:
             name="Startup scan",
         )
 
-        # Startup EOD report 5 seconds from now
-        startup_eod_time = datetime.now(timezone.utc) + timedelta(seconds=5)
-        self.scheduler.add_job(
-            self._end_of_day_close_job,
-            "date",
-            run_date=startup_eod_time,
-            id="startup_eod",
-            name="Startup EOD report",
-        )
-
         self.scheduler.start()
         logger.info("Scheduler started with all jobs registered.")
 
@@ -168,34 +160,68 @@ class Orchestrator:
         """Refresh balance, check fills, and enforce profit targets."""
         try:
             await self._check_order_fills()
+
+            was_halted = self.tracker.state.trading_halted
             self.tracker.refresh_balance()
 
-            # Check profit take opportunities
-            profit_takes = self.tracker.check_profit_takes() if hasattr(self.tracker, "check_profit_takes") else []
-            for position, exit_price in profit_takes:
-                try:
-                    order = self.kalshi.exit_position(
-                        position.ticker, position.side, position.contracts, exit_price
+            # Alert if daily brake just changed
+            new_brake = self.tracker.state.daily_brake_level
+            if not was_halted and self.tracker.state.trading_halted:
+                if self.bot:
+                    await self.bot.send_alert(
+                        f"TRADING HALTED\n{self.tracker.format_summary()}"
                     )
-                    exit_order_id = order.get("order", {}).get("order_id", "")
+
+            # Check per-position exits (profit takes, trailing stops, thesis invalidation)
+            profit_takes = self.tracker.check_profit_takes()
+            for position, exit_price, contracts_to_exit in profit_takes:
+                try:
+                    if contracts_to_exit <= 0:
+                        logger.warning(f"Skipping exit for {position.ticker}: contracts_to_exit={contracts_to_exit}")
+                        continue
+
+                    order = self.kalshi.exit_position(
+                        position.ticker, position.side, contracts_to_exit, exit_price
+                    )
+                    order_data = order.get("order", {})
+                    exit_order_id = order_data.get("order_id", "")
+                    order_status = order_data.get("status", "")
+
                     if exit_order_id:
                         self._bot_exit_order_ids.add(exit_order_id)
 
-                    pnl = (exit_price / 100 - position.entry_price / 100) * position.contracts
-                    self.tracker.record_exit(position.order_id, exit_price, pnl)
+                    if position.side == "yes":
+                        pnl = (exit_price / 100 - position.entry_price / 100) * contracts_to_exit
+                    else:
+                        pnl = (position.entry_price / 100 - exit_price / 100) * contracts_to_exit
 
-                    reconciled = await self._reconcile_exit(
-                        position.ticker, position.side, position.contracts, position.contracts
-                    )
-                    msg = (
-                        f"Profit take: {position.ticker} {position.side.upper()} "
-                        f"exit @ {exit_price}¢ | P&L: ${pnl:+.2f}"
-                    )
-                    if not reconciled:
-                        msg += " (reconciliation warning: position may not have reduced)"
-                    if self.bot:
-                        await self.bot.send_alert(msg)
-                    logger.info(msg)
+                    is_partial = contracts_to_exit < position.contracts
+
+                    if order_status == "executed":
+                        # Filled immediately — record and notify
+                        self.tracker.record_exit(position.order_id, exit_price, pnl, contracts_to_exit)
+                        reconciled = await self._reconcile_exit(
+                            position.ticker, position.side, contracts_to_exit, contracts_to_exit
+                        )
+                        msg = (
+                            f"{'Partial exit' if is_partial else 'Profit take'}: {position.ticker} {position.side.upper()} "
+                            f"{contracts_to_exit}/{position.contracts} contracts @ {exit_price}¢ | P&L: ${pnl:+.2f}"
+                        )
+                        if not reconciled:
+                            msg += " (reconciliation warning)"
+                        if self.bot:
+                            await self.bot.send_alert(msg)
+                        logger.info(msg)
+                    elif exit_order_id:
+                        # Order is resting — store pending, notify when filled
+                        self._pending_exits[exit_order_id] = (position, exit_price, contracts_to_exit, pnl, is_partial)
+                        logger.info(
+                            f"Exit order resting: {position.ticker} {position.side.upper()} "
+                            f"{contracts_to_exit}x @ {exit_price}¢ | order_id={exit_order_id}"
+                        )
+                    else:
+                        logger.warning(f"Exit order for {position.ticker} returned no order_id and status='{order_status}'")
+
                 except Exception as e:
                     logger.error(f"Error exiting position {position.ticker}: {e}")
 
@@ -206,7 +232,7 @@ class Orchestrator:
         """
         Compare current resting orders against known set.
         Notify on fills (orders that disappeared from resting list).
-        Skips orders placed by the bot for position exits.
+        Resolves pending exit orders when they fill.
         """
         try:
             current_resting = self.kalshi.get_orders(status="resting")
@@ -214,13 +240,25 @@ class Orchestrator:
 
             filled_ids = self._known_resting_ids - current_ids
             for oid in filled_ids:
-                if oid in self._bot_exit_order_ids:
+                if oid in self._pending_exits:
+                    # A bot-placed exit order just filled — record and notify
+                    position, exit_price, contracts_to_exit, pnl, is_partial = self._pending_exits.pop(oid)
                     self._bot_exit_order_ids.discard(oid)
-                    continue
-                msg = f"Order filled: {oid}"
-                logger.info(msg)
-                if self.bot:
-                    await self.bot.send_alert(f"Order filled: {oid}")
+                    self.tracker.record_exit(position.order_id, exit_price, pnl, contracts_to_exit)
+                    msg = (
+                        f"{'Partial exit' if is_partial else 'Profit take'}: {position.ticker} {position.side.upper()} "
+                        f"{contracts_to_exit}/{position.contracts} contracts @ {exit_price}¢ | P&L: ${pnl:+.2f}"
+                    )
+                    if self.bot:
+                        await self.bot.send_alert(msg)
+                    logger.info(msg)
+                elif oid in self._bot_exit_order_ids:
+                    self._bot_exit_order_ids.discard(oid)
+                else:
+                    msg = f"Order filled: {oid}"
+                    logger.info(msg)
+                    if self.bot:
+                        await self.bot.send_alert(msg)
 
             self._known_resting_ids = current_ids
         except Exception as e:
@@ -246,11 +284,16 @@ class Orchestrator:
         logger.info("Starting market scan...")
         daily_budget = self.tracker.state.current_balance
         trades_used = self.tracker.state.trades_placed
+        open_position_cost = sum(
+            p.cost_dollars for p in self.tracker.state.positions if p.status == "open"
+        )
 
         try:
             recommendations = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.analysis.get_recommendations(daily_budget, trades_used),
+                lambda: self.analysis.get_recommendations(
+                    daily_budget, trades_used, open_position_cost
+                ),
             )
         except Exception as e:
             logger.error(f"Failed to get recommendations: {e}")
@@ -287,6 +330,8 @@ class Orchestrator:
                 contracts=rec.contracts,
                 entry_price=rec.market_price,
                 cost_dollars=rec.cost_dollars,
+                city=rec.city,
+                market_type=rec.market_type,
             )
 
             logger.info(
@@ -309,7 +354,7 @@ class Orchestrator:
     async def _end_of_day_close_job(self):
         """
         Records day history, analyzes the day, records settlement errors,
-        sends EOD report and learning analysis, then runs GPT advisor.
+        sends EOD report and learning analysis.
         """
         logger.info("Running end-of-day close job...")
 
@@ -345,9 +390,6 @@ class Orchestrator:
                 await self.bot.send_learning_analysis(insights, self.tracker.state)
         except Exception as e:
             logger.error(f"Error sending learning analysis: {e}")
-
-        # Run GPT advisor UNCONDITIONALLY (outside the try/except blocks above)
-        await self._run_gpt_advisor()
 
     async def _record_settlement_errors(self):
         """
@@ -495,6 +537,9 @@ class Orchestrator:
         """Sends morning briefing and applies history insights to analysis engine."""
         logger.info("Sending morning briefing...")
         try:
+            # Refresh balance from Kalshi before reporting
+            self.tracker.refresh_balance()
+
             # Build context for briefing
             context = {
                 "balance": self.tracker.state.current_balance,
@@ -554,61 +599,6 @@ class Orchestrator:
                 logger.info("Settlement backfill: no UNKNOWN positions to update")
         except Exception as e:
             logger.error(f"Settlement backfill error: {e}")
-
-    # -------------------------------------------------------------------------
-    # GPT Advisor
-    # -------------------------------------------------------------------------
-
-    async def _run_gpt_advisor(self):
-        """Runs GPT advisor, sends results to Telegram, and routes suggestions."""
-        logger.info("Running GPT advisor...")
-        try:
-            from src.advisor.gpt_advisor import get_suggestions
-            advice = await asyncio.get_event_loop().run_in_executor(None, get_suggestions)
-
-            if advice and self.bot:
-                await self.bot.send_gpt_suggestions(advice)
-
-            if advice:
-                gpt_run_date = date.today().isoformat()
-                await self._route_suggestions(advice, gpt_run_date)
-
-        except Exception as e:
-            logger.error(f"GPT advisor error: {e}")
-
-    async def _route_suggestions(self, advice: dict, gpt_run_date: str):
-        """
-        Routes suggestions based on priority and category:
-        - HIGH + additive → auto-implement
-        - HIGH/MEDIUM + update/replace → approval queue (Telegram button)
-        - MEDIUM/LOW + additive → info only
-        """
-        from src.advisor.auto_implementer import implement_suggestion
-
-        suggestions = advice.get("suggestions", [])
-        for suggestion in suggestions:
-            priority = suggestion.get("priority", "LOW").upper()
-            category = suggestion.get("category", "additive").lower()
-            title = suggestion.get("title", "")
-
-            if priority == "HIGH" and category == "additive":
-                # Auto-implement
-                result = implement_suggestion(suggestion)
-                logger.info(f"Auto-implemented suggestion '{title}': {result}")
-                if self.bot:
-                    await self.bot.send_alert(
-                        f"Auto-implemented suggestion: {title}\nResult: {result}"
-                    )
-
-            elif priority in ("HIGH", "MEDIUM") and category in ("update", "replace"):
-                # Queue for approval
-                if self.bot and hasattr(self.bot, "queue_for_approval"):
-                    await self.bot.queue_for_approval(suggestion, gpt_run_date)
-                    logger.info(f"Queued for approval: '{title}'")
-
-            else:
-                # Info only — already shown in send_gpt_suggestions
-                logger.info(f"Informational suggestion logged: '{title}'")
 
     # -------------------------------------------------------------------------
     # Reconciliation

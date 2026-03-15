@@ -3,16 +3,13 @@ Telegram bot interface for TradeTheWeather.
 Provides commands for monitoring, controlling, and receiving trade alerts.
 """
 
-import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
 )
@@ -22,61 +19,6 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 USER_ID = int(os.getenv("TELEGRAM_USER_ID", "0"))
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "../../data")
-PENDING_FILE = os.path.join(DATA_DIR, "pending_approvals.json")
-
-
-# -------------------------------------------------------------------------
-# Approval store
-# -------------------------------------------------------------------------
-
-class ApprovalStore:
-    """Stores pending GPT suggestions awaiting user approval."""
-
-    def __init__(self):
-        os.makedirs(DATA_DIR, exist_ok=True)
-
-    def _load(self) -> dict:
-        try:
-            with open(PENDING_FILE) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def _save(self, data: dict):
-        with open(PENDING_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-
-    def add(self, suggestion_id: str, suggestion: dict, gpt_run_date: str):
-        data = self._load()
-        data[suggestion_id] = {
-            "suggestion": suggestion,
-            "gpt_run_date": gpt_run_date,
-            "queued_at": datetime.now(timezone.utc).isoformat(),
-            "status": "pending",
-        }
-        self._save(data)
-
-    def get(self, suggestion_id: str) -> Optional[dict]:
-        data = self._load()
-        return data.get(suggestion_id)
-
-    def update_status(self, suggestion_id: str, status: str):
-        data = self._load()
-        if suggestion_id in data:
-            data[suggestion_id]["status"] = status
-            data[suggestion_id]["resolved_at"] = datetime.now(timezone.utc).isoformat()
-            self._save(data)
-
-    def list_pending(self) -> list:
-        data = self._load()
-        return [
-            {"id": sid, **v}
-            for sid, v in data.items()
-            if v.get("status") == "pending"
-        ]
-
-
 # -------------------------------------------------------------------------
 # Bot class
 # -------------------------------------------------------------------------
@@ -84,7 +26,6 @@ class ApprovalStore:
 class TradeTheWeatherBot:
     def __init__(self, orchestrator):
         self.orchestrator = orchestrator
-        self.approvals = ApprovalStore()
         self.app = Application.builder().token(TOKEN).build()
         self._register_handlers()
 
@@ -97,11 +38,6 @@ class TradeTheWeatherBot:
             CommandHandler("halt", self._cmd_halt),
             CommandHandler("resume", self._cmd_resume),
             CommandHandler("history", self._cmd_history),
-            CommandHandler("suggest", self._cmd_suggest),
-            CommandHandler("pending", self._cmd_pending),
-            CommandHandler("approve", self._cmd_approve),
-            CommandHandler("reject", self._cmd_reject),
-            CallbackQueryHandler(self._handle_callback),
         ]
         for h in handlers:
             self.app.add_handler(h)
@@ -118,7 +54,7 @@ class TradeTheWeatherBot:
             return
         await update.message.reply_text(
             "TradeTheWeather bot is running.\n"
-            "Commands: /status /scan /positions /halt /resume /history /suggest /pending"
+            "Commands: /status /scan /positions /halt /resume /history"
         )
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -189,136 +125,6 @@ class TradeTheWeatherBot:
         except Exception as e:
             text = f"Error loading history: {e}"
         await update.message.reply_text(text)
-
-    async def _cmd_suggest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_authorized(update):
-            return
-        await update.message.reply_text("Running GPT advisor (this may take 30 seconds)...")
-        try:
-            await self.orchestrator._run_gpt_advisor()
-        except Exception as e:
-            await update.message.reply_text(f"GPT advisor error: {e}")
-
-    async def _cmd_pending(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_authorized(update):
-            return
-        pending = self.approvals.list_pending()
-        if not pending:
-            await update.message.reply_text("No pending suggestions.")
-            return
-        lines = ["Pending Approvals:"]
-        for item in pending:
-            s = item.get("suggestion", {})
-            lines.append(
-                f"  [{item['id']}] {s.get('title', '?')} "
-                f"({s.get('priority', '?')}/{s.get('category', '?')})"
-            )
-        lines.append("\nUse /approve <id> or /reject <id>")
-        await update.message.reply_text("\n".join(lines))
-
-    async def _cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_authorized(update):
-            return
-        if not context.args:
-            await update.message.reply_text("Usage: /approve <id>")
-            return
-        suggestion_id = context.args[0]
-        entry = self.approvals.get(suggestion_id)
-        if not entry:
-            await update.message.reply_text(f"No pending suggestion with id: {suggestion_id}")
-            return
-        suggestion = entry.get("suggestion", {})
-        from src.advisor.auto_implementer import implement_suggestion
-        result = implement_suggestion(suggestion)
-        self.approvals.update_status(suggestion_id, "approved")
-        await update.message.reply_text(
-            f"Approved: {suggestion.get('title', suggestion_id)}\nResult: {result}"
-        )
-
-    async def _cmd_reject(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_authorized(update):
-            return
-        if not context.args:
-            await update.message.reply_text("Usage: /reject <id>")
-            return
-        suggestion_id = context.args[0]
-        entry = self.approvals.get(suggestion_id)
-        if not entry:
-            await update.message.reply_text(f"No pending suggestion with id: {suggestion_id}")
-            return
-        self.approvals.update_status(suggestion_id, "rejected")
-        await update.message.reply_text(
-            f"Rejected: {entry.get('suggestion', {}).get('title', suggestion_id)}"
-        )
-
-    async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle inline keyboard button presses for approve/reject."""
-        query = update.callback_query
-        if not query:
-            return
-        await query.answer()
-
-        data = query.data or ""
-        if data.startswith("approve:"):
-            suggestion_id = data[len("approve:"):]
-            entry = self.approvals.get(suggestion_id)
-            if entry:
-                from src.advisor.auto_implementer import implement_suggestion
-                result = implement_suggestion(entry.get("suggestion", {}))
-                self.approvals.update_status(suggestion_id, "approved")
-                await query.edit_message_text(
-                    f"Approved: {entry.get('suggestion', {}).get('title', suggestion_id)}\n{result}"
-                )
-            else:
-                await query.edit_message_text("Suggestion not found.")
-
-        elif data.startswith("reject:"):
-            suggestion_id = data[len("reject:"):]
-            entry = self.approvals.get(suggestion_id)
-            if entry:
-                self.approvals.update_status(suggestion_id, "rejected")
-                await query.edit_message_text(
-                    f"Rejected: {entry.get('suggestion', {}).get('title', suggestion_id)}"
-                )
-            else:
-                await query.edit_message_text("Suggestion not found.")
-
-    # -------------------------------------------------------------------------
-    # Approval queue
-    # -------------------------------------------------------------------------
-
-    async def queue_for_approval(self, suggestion: dict, gpt_run_date: str):
-        """Stores a suggestion for approval and sends an inline keyboard message."""
-        suggestion_id = suggestion.get("id", f"s_{datetime.now(timezone.utc).timestamp():.0f}")
-        self.approvals.add(suggestion_id, suggestion, gpt_run_date)
-
-        priority = suggestion.get("priority", "?")
-        category = suggestion.get("category", "?")
-        title = suggestion.get("title", "?")
-        desc = suggestion.get("description", "")[:200]
-
-        text = (
-            f"Approval needed [{priority}/{category}]\n"
-            f"Title: {title}\n"
-            f"Description: {desc}\n"
-            f"ID: {suggestion_id}"
-        )
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Approve", callback_data=f"approve:{suggestion_id}"),
-                InlineKeyboardButton("Reject", callback_data=f"reject:{suggestion_id}"),
-            ]
-        ])
-
-        try:
-            await self.app.bot.send_message(
-                chat_id=USER_ID,
-                text=text,
-                reply_markup=keyboard,
-            )
-        except Exception as e:
-            logger.error(f"Failed to send approval request: {e}")
 
     # -------------------------------------------------------------------------
     # Outgoing alerts
@@ -395,43 +201,10 @@ class TradeTheWeatherBot:
     async def send_learning_analysis(self, insights, daily_state):
         """Sends learning insights summary."""
         try:
-            from src.tracker.history import DailyHistoryTracker
-            tracker = DailyHistoryTracker()
-            text = tracker.format_insights()
+            text = self.orchestrator.history.format_insights()
             await self.send_alert(f"Learning Analysis:\n{text}")
         except Exception as e:
             logger.error(f"Failed to send learning analysis: {e}")
-
-    async def send_gpt_suggestions(self, advice: dict):
-        """Formats and sends GPT strategy suggestions."""
-        try:
-            summary = advice.get("summary", "No summary.")
-            suggestions = advice.get("suggestions", [])
-
-            lines = [f"GPT Advisor Report\n{summary}", ""]
-            for i, s in enumerate(suggestions, 1):
-                lines.append(
-                    f"{i}. [{s.get('priority','?')}/{s.get('category','?')}] "
-                    f"{s.get('title','?')}"
-                )
-                lines.append(f"   {s.get('description','')}")
-                lines.append(f"   Expected impact: {s.get('expected_impact','?')}")
-                lines.append("")
-
-            mdf_rec = advice.get("market_disagreement_filter_recommendation", "")
-            if mdf_rec:
-                lines.append(
-                    f"Market Disagreement Filter: {mdf_rec}\n"
-                    f"{advice.get('market_disagreement_filter_reasoning','')}"
-                )
-
-            full_text = "\n".join(lines)
-            chunks = _split_message(full_text, max_len=4000)
-            for chunk in chunks:
-                await self.send_alert(chunk)
-
-        except Exception as e:
-            logger.error(f"Failed to send GPT suggestions: {e}")
 
     async def send_morning_briefing(self, context: dict):
         """Sends morning briefing with balance and market count."""

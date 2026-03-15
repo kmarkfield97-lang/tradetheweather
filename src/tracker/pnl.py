@@ -1,26 +1,261 @@
 """
-Daily P&L tracker.
-Enforces hard rules:
-  - Stop trading at +5% gain
-  - Stop trading and exit positions at -5% loss
-  - Max 5 trades per day
-  - Max 20% of daily budget per position
+Daily P&L tracker with weather-aware exit framework.
+
+Exit logic philosophy:
+  - Compare expected value of holding vs exiting at current market price
+  - Classify each position as locked / near_locked / live / broken
+  - Use staged profit-taking, progressive trailing stops, thesis invalidation
+  - Staged portfolio brake on daily drawdown (-3% / -4% / -5%)
+  - Never rely on a blanket time-based no-sell rule near settlement
 """
 
 import json
+import logging
+import math
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), "../../data")
 DAILY_FILE = os.path.join(DATA_DIR, "daily_state.json")
 
-PROFIT_TARGET_PCT = 0.05   # +5%
-STOP_LOSS_PCT = 0.05       # -5%
-MAX_TRADES = 5
+# ─── Daily account-level thresholds ──────────────────────────────────────────
+PROFIT_TARGET_PCT = 0.05        # halt new trades at +5% day gain
+DAILY_BRAKE_SOFT_PCT = 0.03     # -3%: disable new entries, tighten exits
+DAILY_BRAKE_MEDIUM_PCT = 0.04   # -4%: reduce weaker / non-locked positions
+DAILY_BRAKE_HARD_PCT = 0.05     # -5%: flatten all non-locked positions immediately
+MAX_TRADES = 999999             # unlimited — cash reserve enforces real limit
 MAX_POSITION_PCT = 0.20
+MIN_CASH_RESERVE_PCT = 0.20
 
+# ─── Staged profit-taking (fractional exits at price bands) ──────────────────
+# Each entry: (min_cents, max_cents, trim_fraction)
+# trim_fraction = portion of contracts to exit (0 = none, 1.0 = all)
+PROFIT_TAKE_BANDS = [
+    (70, 79, 0.25),   # 70–79¢: trim 25% if not locked
+    (80, 89, 0.40),   # 80–89¢: trim 40% if not locked
+    (90, 95, 0.65),   # 90–95¢: trim 65% unless locked
+    (96, 99, 0.85),   # 96–99¢: exit 85% unless source mechanics secure outcome
+]
+
+# ─── Progressive trailing stop bands ─────────────────────────────────────────
+# Arms after peak > entry + 25%. Tightens as peak rises.
+# Each entry: (peak_min_cents, peak_max_cents, giveback_fraction)
+# giveback_fraction = exit if mark < peak * (1 - giveback_fraction)
+TRAILING_STOP_ARM_PCT = 0.25        # arm after +25% gain from entry
+TRAILING_STOP_BANDS = [
+    (40, 59, 0.22),   # peak 40–59¢: allow 22% giveback
+    (60, 79, 0.16),   # peak 60–79¢: allow 16% giveback
+    (80, 89, 0.10),   # peak 80–89¢: allow 10% giveback
+    (90, 99, 0.05),   # peak 90¢+:    allow 5% giveback
+]
+
+# ─── Salvage stop (fail-safe only) ───────────────────────────────────────────
+SALVAGE_STOP_PCT = 0.35         # exit if mark < 35% of entry (unrecoverable)
+
+# ─── Settlement / fair-value parameters ──────────────────────────────────────
+SETTLEMENT_RISK_BUFFER = 0.05   # subtract 5% from modeled prob for settlement uncertainty
+SLIPPAGE_CENTS = 2              # estimated slippage cost in cents per contract
+FEE_CENTS = 0                   # Kalshi fees (currently 0 for makers)
+FINAL_HOUR_CONSERVATISM = 1.20  # multiply exit attractiveness by this in last hour
+
+# ─── Thesis invalidation sensitivity ─────────────────────────────────────────
+THESIS_TEMP_DIVERGENCE_F = 4.0  # °F: if current obs diverges this much, invalidate
+THESIS_TREND_REVERSAL_F_PER_HR = -1.5  # °F/hr: sustained cooling triggers invalidation
+
+# ─── Position state classification ───────────────────────────────────────────
+STATE_LOCKED = "locked"
+STATE_NEAR_LOCKED = "near_locked"
+STATE_LIVE = "live"
+STATE_BROKEN = "broken"
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _parse_ticker(ticker: str) -> dict:
+    """Extract market_type, threshold, is_bucket, and city prefix from ticker."""
+    result = {"market_type": None, "threshold": None, "is_bucket": False, "city": None}
+    t = ticker.upper()
+
+    if "HIGHT" in t or "HIGH" in t:
+        result["market_type"] = "temp_high"
+    elif "LOWT" in t or "LOW" in t:
+        result["market_type"] = "temp_low"
+    elif "RAIN" in t:
+        result["market_type"] = "rain"
+    elif "SNOW" in t:
+        result["market_type"] = "snow"
+
+    m = re.search(r"-([TB])([\d.]+)(?:-|$)", t)
+    if m:
+        result["is_bucket"] = (m.group(1) == "B")
+        result["threshold"] = float(m.group(2))
+
+    return result
+
+
+def _hours_to_settlement(close_time_str: Optional[str]) -> Optional[float]:
+    """Returns hours remaining to settlement, or None if unparseable."""
+    if not close_time_str:
+        return None
+    try:
+        ct = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+        return (ct - datetime.now(timezone.utc)).total_seconds() / 3600
+    except Exception:
+        return None
+
+
+def _get_close_time(ticker: str, kalshi_client) -> Optional[str]:
+    try:
+        data = kalshi_client.get_market(ticker)
+        m = data.get("market", data)
+        return m.get("close_time") or m.get("expiration_time")
+    except Exception:
+        return None
+
+
+def _is_near_settlement(ticker: str, kalshi_client, min_hours: float) -> bool:
+    ct = _get_close_time(ticker, kalshi_client)
+    hrs = _hours_to_settlement(ct)
+    return hrs is not None and hrs < min_hours
+
+
+def _trailing_stop_floor(peak: int) -> Optional[int]:
+    """
+    Returns the trailing stop floor price (cents) for a given peak price,
+    or None if the trailing stop has not yet armed.
+    """
+    for band_min, band_max, giveback in TRAILING_STOP_BANDS:
+        if band_min <= peak <= band_max:
+            return round(peak * (1 - giveback))
+    return None
+
+
+def _staged_trim_fraction(mark: int, is_locked: bool) -> float:
+    """
+    Returns the fraction of contracts to trim at the current mark price.
+    0 means hold, 1.0 means exit all.
+    """
+    for band_min, band_max, fraction in PROFIT_TAKE_BANDS:
+        if band_min <= mark <= band_max:
+            return 0.0 if is_locked else fraction
+    return 0.0
+
+
+def _classify_position(
+    pos,
+    mark: int,
+    hours_left: Optional[float],
+    weather_report: Optional[dict],
+) -> str:
+    """
+    Classify a position as locked / near_locked / live / broken.
+
+    locked:      outcome effectively secured (already hit threshold or clearly lost)
+    near_locked: very high confidence (85%+ market price, <1hr left)
+    live:        still depends on future weather path
+    broken:      thesis invalidated by observations or trend
+    """
+    parsed = _parse_ticker(pos.ticker)
+    threshold = parsed.get("threshold")
+    market_type = parsed.get("market_type")
+
+    # near_locked: market is pricing very high confidence and time is short
+    if hours_left is not None and hours_left < 1.0:
+        if mark >= 90:
+            return STATE_NEAR_LOCKED
+        if mark <= 10:
+            return STATE_NEAR_LOCKED  # effectively lost
+
+    if weather_report and market_type in ("temp_high", "temp_low") and threshold is not None:
+        obs = weather_report.get("recent_observations", [])
+        trend = weather_report.get("temp_trend")  # °F/hr
+
+        if obs:
+            current_temp = obs[0].get("temp_f")
+            if current_temp is not None:
+                gap = current_temp - threshold if market_type == "temp_high" else threshold - current_temp
+                # locked: already crossed threshold with little time left
+                if gap >= 0 and hours_left is not None and hours_left < 2.0:
+                    return STATE_LOCKED
+
+                # broken: temp is far from threshold and time is short
+                if gap < -THESIS_TEMP_DIVERGENCE_F and hours_left is not None and hours_left < 3.0:
+                    return STATE_BROKEN
+
+                # broken: sustained trend moving strongly against us
+                if (trend is not None and
+                        trend <= THESIS_TREND_REVERSAL_F_PER_HR and
+                        gap < 0 and
+                        hours_left is not None and hours_left < 4.0):
+                    return STATE_BROKEN
+
+    # near_locked: high market confidence regardless of weather data
+    if mark >= 88 or mark <= 12:
+        return STATE_NEAR_LOCKED
+
+    return STATE_LIVE
+
+
+def _model_hold_value(
+    pos,
+    mark: int,
+    state: str,
+    hours_left: Optional[float],
+    weather_report: Optional[dict],
+) -> float:
+    """
+    Estimates the expected value (cents) of holding to settlement.
+    Accounts for settlement risk buffer and time decay of uncertainty.
+    """
+    if state == STATE_LOCKED:
+        # Functionally resolved — hold value ≈ 100 minus tiny settlement risk
+        return 100 - (SETTLEMENT_RISK_BUFFER * 100 * 0.5)
+
+    if state == STATE_BROKEN:
+        # Thesis broken — hold value ≈ 0
+        return SETTLEMENT_RISK_BUFFER * 100
+
+    # Base: use current market price as unbiased estimate of settlement prob
+    implied_prob = mark / 100.0
+
+    # Adjust for settlement risk (uncertainty about official reading)
+    if hours_left is not None and hours_left < 2.0:
+        # Final window: increase risk buffer due to last-mile uncertainty
+        risk_buffer = SETTLEMENT_RISK_BUFFER * FINAL_HOUR_CONSERVATISM
+    else:
+        risk_buffer = SETTLEMENT_RISK_BUFFER
+
+    # Weather trend adjustment
+    parsed = _parse_ticker(pos.ticker)
+    market_type = parsed.get("market_type")
+    threshold = parsed.get("threshold")
+    if weather_report and market_type in ("temp_high", "temp_low") and threshold is not None:
+        trend = weather_report.get("temp_trend", 0) or 0
+        obs = weather_report.get("recent_observations", [])
+        if obs and hours_left is not None:
+            current_temp = obs[0].get("temp_f")
+            if current_temp is not None:
+                gap = current_temp - threshold if market_type == "temp_high" else threshold - current_temp
+                # Positive gap = already past threshold (good), negative = still needs to move
+                warming_needed = -gap
+                hrs_remaining = max(hours_left, 0.1)
+                required_rate = warming_needed / hrs_remaining
+                # If required warming rate is unrealistic (>3°F/hr) reduce hold value
+                if required_rate > 3.0:
+                    implied_prob = max(0.02, implied_prob - 0.15)
+                elif required_rate > 1.5:
+                    implied_prob = max(0.05, implied_prob - 0.07)
+
+    adjusted_prob = max(0.01, min(0.99, implied_prob - risk_buffer))
+    return adjusted_prob * 100
+
+
+# ─── Dataclasses ─────────────────────────────────────────────────────────────
 
 @dataclass
 class Position:
@@ -28,12 +263,16 @@ class Position:
     order_id: str
     side: str
     contracts: int
-    entry_price: int       # cents
+    entry_price: int            # cents
     cost_dollars: float
-    status: str            # "open" / "closed" / "expired"
+    status: str                 # "open" / "closed" / "expired"
     pnl_dollars: float = 0.0
     exit_price: Optional[int] = None
     placed_at: str = ""
+    high_water_mark: Optional[int] = None   # peak mark-to-market price (cents)
+    trimmed_contracts: int = 0              # contracts already exited via staged trim
+    city: str = ""                          # city key (e.g. "NYC", "DENVER")
+    market_type: str = ""                   # "temp_high" / "temp_low" / "rain" / "snow"
 
 
 @dataclass
@@ -47,17 +286,19 @@ class DailyState:
     halt_reason: str = ""
     goal_met: bool = False
     realized_pnl: float = 0.0
+    daily_brake_level: int = 0   # 0=none, 1=soft(-3%), 2=medium(-4%), 3=hard(-5%)
 
+
+# ─── PnLTracker ──────────────────────────────────────────────────────────────
 
 class PnLTracker:
-    def __init__(self, kalshi_client=None):
+    def __init__(self, kalshi_client=None, weather_pipeline=None):
         self.kalshi = kalshi_client
+        self.weather = weather_pipeline
         os.makedirs(DATA_DIR, exist_ok=True)
         self.state = self._load_or_init()
 
-    # -------------------------------------------------------------------------
-    # State management
-    # -------------------------------------------------------------------------
+    # ── State management ──────────────────────────────────────────────────────
 
     def _load_or_init(self) -> DailyState:
         today = date.today().isoformat()
@@ -65,12 +306,14 @@ class PnLTracker:
             with open(DAILY_FILE) as f:
                 data = json.load(f)
             if data.get("date") == today:
-                state = DailyState(**{
-                    **data,
-                    "positions": [Position(**p) for p in data.get("positions", [])]
-                })
-                return state
-        # New day — fetch starting balance
+                known_pos = {k for k in Position.__dataclass_fields__}
+                known_state = {k for k in DailyState.__dataclass_fields__}
+                positions = [
+                    Position(**{k: v for k, v in p.items() if k in known_pos})
+                    for p in data.get("positions", [])
+                ]
+                state_data = {k: v for k, v in data.items() if k in known_state and k != "positions"}
+                return DailyState(**state_data, positions=positions)
         starting_balance = self._fetch_balance()
         state = DailyState(
             date=today,
@@ -82,9 +325,8 @@ class PnLTracker:
 
     def _save(self, state: DailyState = None):
         state = state or self.state
-        data = asdict(state)
         with open(DAILY_FILE, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(asdict(state), f, indent=2)
 
     def _fetch_balance(self) -> float:
         if self.kalshi:
@@ -92,14 +334,12 @@ class PnLTracker:
                 return self.kalshi.get_balance()
             except Exception:
                 pass
-        return 50.0  # default fallback
+        return 50.0
 
-    # -------------------------------------------------------------------------
-    # Rule checks
-    # -------------------------------------------------------------------------
+    # ── Rule checks & daily brakes ────────────────────────────────────────────
 
     def refresh_balance(self):
-        """Sync current balance from Kalshi."""
+        """Sync current balance from Kalshi and evaluate daily brakes."""
         self.state.current_balance = self._fetch_balance()
         self._check_rules()
         self._save()
@@ -107,39 +347,230 @@ class PnLTracker:
     def _check_rules(self):
         starting = self.state.starting_balance
         current = self.state.current_balance
+        if starting <= 0:
+            return
+
+        # Guard: if account is too small to trade meaningfully, disable entries
+        # but do NOT treat percentage swings as meaningful profit targets.
+        if starting < 5.0:
+            if not self.state.trading_halted:
+                self.state.trading_halted = True
+                self.state.halt_reason = (
+                    f"Account balance ${starting:.2f} too small to trade safely (minimum $5)"
+                )
+            return
+
         pnl_pct = (current - starting) / starting
 
+        # Daily profit target
         if pnl_pct >= PROFIT_TARGET_PCT and not self.state.goal_met:
             self.state.goal_met = True
             self.state.trading_halted = True
             self.state.halt_reason = f"Daily profit target reached (+{pnl_pct * 100:.1f}%)"
+            return
 
-        if pnl_pct <= -STOP_LOSS_PCT and not self.state.trading_halted:
+        if self.state.trading_halted:
+            return
+
+        # Staged brake system
+        if pnl_pct <= -DAILY_BRAKE_HARD_PCT and self.state.daily_brake_level < 3:
+            self.state.daily_brake_level = 3
             self.state.trading_halted = True
-            self.state.halt_reason = f"Stop loss triggered ({pnl_pct * 100:.1f}%)"
+            self.state.halt_reason = f"Daily stop loss triggered ({pnl_pct * 100:.1f}%)"
+            self._save()
+            self.trigger_stop_loss(locked_ok=True)
+
+        elif pnl_pct <= -DAILY_BRAKE_MEDIUM_PCT and self.state.daily_brake_level < 2:
+            self.state.daily_brake_level = 2
+            logger.warning(f"Daily brake MEDIUM: {pnl_pct * 100:.1f}% drawdown — tightening exits")
+
+        elif pnl_pct <= -DAILY_BRAKE_SOFT_PCT and self.state.daily_brake_level < 1:
+            self.state.daily_brake_level = 1
+            self.state.trading_halted = True
+            self.state.halt_reason = f"Daily brake soft: new entries disabled ({pnl_pct * 100:.1f}%)"
+            logger.warning(f"Daily brake SOFT: {pnl_pct * 100:.1f}% drawdown — new entries disabled")
 
     def can_trade(self) -> tuple[bool, str]:
-        """Returns (True, '') if trading is allowed, else (False, reason)."""
         if self.state.trading_halted:
             return False, self.state.halt_reason
-        if self.state.trades_placed >= MAX_TRADES:
-            return False, f"Maximum trades for the day reached ({MAX_TRADES})"
+        reserve = self.state.current_balance * MIN_CASH_RESERVE_PCT
+        if self.state.current_balance <= reserve:
+            return False, f"Balance ${self.state.current_balance:.2f} at or below 20% cash reserve (${reserve:.2f})"
         return True, ""
 
     def validate_position_size(self, cost_dollars: float) -> tuple[bool, str]:
-        """Validates a proposed position size against the 20% rule."""
         max_allowed = self.state.starting_balance * MAX_POSITION_PCT
         if cost_dollars > max_allowed:
             return False, f"Position size ${cost_dollars:.2f} exceeds 20% limit (${max_allowed:.2f})"
         return True, ""
 
-    # -------------------------------------------------------------------------
-    # Trade recording
-    # -------------------------------------------------------------------------
+    # ── Per-position exit evaluation ──────────────────────────────────────────
+
+    def check_profit_takes(self) -> list[tuple["Position", int, int]]:
+        """
+        Evaluates all open positions for exit conditions.
+        Returns list of (position, exit_price_cents, contracts_to_exit).
+
+        Exit decision framework (in priority order):
+        1. Thesis invalidation (broken state)
+        2. Daily brake medium: reduce non-locked positions
+        3. Staged profit-taking in price bands
+        4. Progressive trailing stop
+        5. Fair-value comparison (hold EV vs exit EV)
+        6. Salvage stop (fail-safe)
+        """
+        if not self.kalshi:
+            return []
+
+        exits = []
+
+        for pos in self.state.positions:
+            if pos.status != "open":
+                continue
+
+            remaining = pos.contracts - pos.trimmed_contracts
+            if remaining <= 0:
+                continue
+
+            # ── Get current market price ──────────────────────────────────────
+            try:
+                liquidity = self.kalshi.get_liquidity(pos.ticker)
+            except Exception as e:
+                logger.debug(f"Liquidity fetch failed for {pos.ticker}: {e}")
+                continue
+
+            mark = liquidity.get("best_yes_price" if pos.side == "yes" else "best_no_price")
+            if not mark or mark <= 0:
+                logger.debug(f"No liquid exit for {pos.ticker} {pos.side}")
+                continue
+
+            # ── Settlement timing ─────────────────────────────────────────────
+            close_time_str = _get_close_time(pos.ticker, self.kalshi)
+            hours_left = _hours_to_settlement(close_time_str)
+
+            # ── Weather data (best-effort) ────────────────────────────────────
+            weather_report = None
+            if self.weather:
+                try:
+                    parsed = _parse_ticker(pos.ticker)
+                    city = self._infer_city(pos.ticker)
+                    if city:
+                        weather_report = self.weather.get_full_report(city)
+                except Exception:
+                    pass
+
+            # ── Update high_water_mark ────────────────────────────────────────
+            if pos.high_water_mark is None or mark > pos.high_water_mark:
+                pos.high_water_mark = mark
+                self._save()
+
+            hwm = pos.high_water_mark or pos.entry_price
+
+            # ── Classify position state ───────────────────────────────────────
+            state = _classify_position(pos, mark, hours_left, weather_report)
+
+            # ── Fair value comparison ─────────────────────────────────────────
+            hold_ev = _model_hold_value(pos, mark, state, hours_left, weather_report)
+            exit_ev = mark - SLIPPAGE_CENTS - FEE_CENTS
+
+            # Apply final-hour conservatism (favor exiting if not locked)
+            if hours_left is not None and hours_left < 1.0 and state not in (STATE_LOCKED, STATE_NEAR_LOCKED):
+                exit_ev_adj = exit_ev * FINAL_HOUR_CONSERVATISM
+            else:
+                exit_ev_adj = exit_ev
+
+            # ── Detailed decision log ─────────────────────────────────────────
+            logger.info(
+                f"EXIT_EVAL {pos.ticker} {pos.side.upper()} | "
+                f"entry={pos.entry_price}¢ mark={mark}¢ peak={hwm}¢ | "
+                f"state={state} hrs_left={hours_left:.1f if hours_left else 'N/A'} | "
+                f"hold_ev={hold_ev:.1f}¢ exit_ev={exit_ev_adj:.1f}¢ | "
+                f"pnl=${((mark - pos.entry_price) / 100 * remaining):+.2f} contracts={remaining}"
+            )
+
+            exit_contracts = 0
+            exit_reason = None
+
+            # ── Priority 1: Thesis invalidation (broken) ──────────────────────
+            if state == STATE_BROKEN:
+                exit_contracts = remaining
+                exit_reason = "thesis_invalidated"
+
+            # ── Priority 2: Daily brake medium → reduce non-locked ────────────
+            elif self.state.daily_brake_level >= 2 and state not in (STATE_LOCKED, STATE_NEAR_LOCKED):
+                exit_contracts = remaining
+                exit_reason = "daily_brake_medium"
+
+            # ── Priority 3: Staged profit-taking ─────────────────────────────
+            elif mark >= PROFIT_TAKE_BANDS[0][0]:  # at or above lowest band (70¢)
+                is_locked = state in (STATE_LOCKED, STATE_NEAR_LOCKED)
+                trim_frac = _staged_trim_fraction(mark, is_locked)
+                if trim_frac > 0:
+                    trim_count = max(1, math.floor(remaining * trim_frac))
+                    # Only trim if we haven't already trimmed this band
+                    already_trimmed_frac = pos.trimmed_contracts / max(pos.contracts, 1)
+                    if trim_frac > already_trimmed_frac + 0.05:
+                        exit_contracts = trim_count
+                        exit_reason = f"staged_profit_{mark}¢"
+
+            # ── Priority 4: Progressive trailing stop ─────────────────────────
+            if exit_contracts == 0 and hwm >= pos.entry_price * (1 + TRAILING_STOP_ARM_PCT):
+                floor = _trailing_stop_floor(hwm)
+                if floor is not None and mark < floor:
+                    exit_contracts = remaining
+                    exit_reason = f"trailing_stop(peak={hwm}¢,floor={floor}¢)"
+
+            # ── Priority 5: Fair-value exit ───────────────────────────────────
+            if exit_contracts == 0 and exit_ev_adj >= hold_ev and state not in (STATE_LOCKED,):
+                exit_contracts = remaining
+                exit_reason = f"fair_value(exit_ev={exit_ev_adj:.1f}>hold_ev={hold_ev:.1f})"
+
+            # ── Priority 6: Salvage stop (fail-safe) ─────────────────────────
+            if exit_contracts == 0:
+                salvage_price = round(pos.entry_price * SALVAGE_STOP_PCT)
+                if mark < salvage_price:
+                    exit_contracts = remaining
+                    exit_reason = f"salvage_stop(mark={mark}¢<{salvage_price}¢)"
+
+            if exit_contracts > 0 and exit_reason:
+                # Clamp to remaining
+                exit_contracts = min(exit_contracts, remaining)
+                logger.info(
+                    f"EXIT DECISION: {pos.ticker} {pos.side.upper()} "
+                    f"exit {exit_contracts}/{pos.contracts} @ {mark}¢ | reason={exit_reason}"
+                )
+                exits.append((pos, mark, exit_contracts))
+
+        return exits
+
+    def _infer_city(self, ticker: str) -> Optional[str]:
+        """Infer city name from ticker prefix using engine's series map."""
+        try:
+            t = ticker.upper()
+            SERIES_CITY_MAP = {
+                "KXHIGHTPHX": "PHOENIX", "KXHIGHTHOU": "HOUSTON", "KXHIGHTMIN": "MINNEAPOLIS",
+                "KXHIGHTDAL": "DALLAS", "KXHIGHTLV": "LAS_VEGAS", "KXHIGHTSATX": "SAN_ANTONIO",
+                "KXHIGHTBOS": "BOSTON", "KXHIGHTNOLA": "NEW_ORLEANS", "KXHIGHTSFO": "SAN_FRANCISCO",
+                "KXHIGHTSEA": "SEATTLE", "KXHIGHTDC": "DC",
+                "KXHIGHTATL": "ATLANTA", "KXHIGHTOKC": "OKLAHOMA_CITY",
+                "KXLOWTCHI": "CHICAGO", "KXLOWTDEN": "DENVER", "KXLOWTNYC": "NYC",
+                "KXLOWTPHIL": "PHILADELPHIA", "KXLOWTMIA": "MIAMI", "KXLOWTLAX": "LOS_ANGELES",
+                "KXLOWTAUS": "AUSTIN",
+                "KXRAINNYC": "NYC", "KXRAINHOU": "HOUSTON", "KXRAINCHIM": "CHICAGO",
+                "KXRAINSEA": "SEATTLE",
+            }
+            for prefix, city in SERIES_CITY_MAP.items():
+                if t.startswith(prefix):
+                    return city
+        except Exception:
+            pass
+        return None
+
+    # ── Trade recording ───────────────────────────────────────────────────────
 
     def record_trade(self, ticker: str, order_id: str, side: str,
-                     contracts: int, entry_price: int, cost_dollars: float):
-        """Records a newly placed trade."""
+                     contracts: int, entry_price: int, cost_dollars: float,
+                     city: str = "", market_type: str = ""):
         pos = Position(
             ticker=ticker,
             order_id=order_id,
@@ -149,70 +580,102 @@ class PnLTracker:
             cost_dollars=cost_dollars,
             status="open",
             placed_at=datetime.now(timezone.utc).isoformat(),
+            city=city,
+            market_type=market_type,
         )
         self.state.positions.append(pos)
         self.state.trades_placed += 1
         self._save()
 
-    def record_exit(self, order_id: str, exit_price: int, pnl_dollars: float):
-        """Records the exit of a position."""
+    def record_exit(self, order_id: str, exit_price: int, pnl_dollars: float,
+                    contracts_exited: Optional[int] = None):
+        """
+        Records an exit. If contracts_exited < pos.contracts, records a partial exit
+        by updating trimmed_contracts. Full exit sets status to 'closed'.
+        """
         for pos in self.state.positions:
             if pos.order_id == order_id and pos.status == "open":
-                pos.status = "closed"
+                total = pos.contracts
+                exited = contracts_exited if contracts_exited is not None else total
+                pos.trimmed_contracts = min(total, pos.trimmed_contracts + exited)
+                pos.pnl_dollars += pnl_dollars
                 pos.exit_price = exit_price
-                pos.pnl_dollars = pnl_dollars
                 self.state.realized_pnl += pnl_dollars
+                if pos.trimmed_contracts >= total:
+                    pos.status = "closed"
                 break
         self._save()
 
-    # -------------------------------------------------------------------------
-    # Stop loss — exit all positions
-    # -------------------------------------------------------------------------
+    # ── Stop loss ─────────────────────────────────────────────────────────────
 
-    def trigger_stop_loss(self) -> list[str]:
+    def trigger_stop_loss(self, locked_ok: bool = False) -> list[str]:
         """
-        Attempts to exit all open positions.
-        Returns list of tickers that were exited or attempted.
+        Exit all open positions. If locked_ok=True, allows locked positions to remain.
+        Returns list of tickers exited.
         """
-        self.state.trading_halted = True
-        self.state.halt_reason = "Stop loss triggered — exiting all positions"
-        self._save()
+        if not self.kalshi:
+            return []
 
         exited = []
-        if not self.kalshi:
-            return exited
-
         for pos in self.state.positions:
             if pos.status != "open":
                 continue
-            try:
-                # Get current market price to exit at
-                liquidity = self.kalshi.get_liquidity(pos.ticker)
-                exit_price = liquidity.get("best_no_price") if pos.side == "yes" else liquidity.get("best_yes_price")
-                if exit_price:
-                    self.kalshi.exit_position(pos.ticker, pos.side, pos.contracts, exit_price)
-                    pnl = (exit_price / 100 - pos.entry_price / 100) * pos.contracts
-                    self.record_exit(pos.order_id, exit_price, pnl)
-                    exited.append(pos.ticker)
-            except Exception:
+
+            remaining = pos.contracts - pos.trimmed_contracts
+            if remaining <= 0:
                 continue
+
+            # If locked_ok, check state and skip locked positions
+            if locked_ok:
+                try:
+                    liq = self.kalshi.get_liquidity(pos.ticker)
+                    mark = liq.get("best_yes_price" if pos.side == "yes" else "best_no_price") or 50
+                    ct = _get_close_time(pos.ticker, self.kalshi)
+                    hrs = _hours_to_settlement(ct)
+                    state = _classify_position(pos, mark, hrs, None)
+                    if state == STATE_LOCKED:
+                        logger.info(f"Stop loss: skipping locked position {pos.ticker}")
+                        continue
+                except Exception:
+                    pass  # can't determine state — exit anyway
+
+            try:
+                liquidity = self.kalshi.get_liquidity(pos.ticker)
+                if pos.side == "yes":
+                    exit_price = liquidity.get("best_yes_price")
+                else:
+                    exit_price = liquidity.get("best_no_price")
+
+                if not exit_price:
+                    logger.warning(f"Stop loss: no exit price for {pos.ticker}")
+                    continue
+
+                self.kalshi.exit_position(pos.ticker, pos.side, remaining, exit_price)
+
+                if pos.side == "yes":
+                    pnl = (exit_price / 100 - pos.entry_price / 100) * remaining
+                else:
+                    pnl = (pos.entry_price / 100 - exit_price / 100) * remaining
+
+                self.record_exit(pos.order_id, exit_price, pnl, remaining)
+                exited.append(pos.ticker)
+                logger.info(f"Stop loss exit: {pos.ticker} {pos.side.upper()} {remaining}x @ {exit_price}¢ pnl=${pnl:+.2f}")
+
+            except Exception as e:
+                logger.error(f"Failed to exit {pos.ticker} on stop loss: {e}")
 
         self._save()
         return exited
 
-    # -------------------------------------------------------------------------
-    # Daily summary
-    # -------------------------------------------------------------------------
+    # ── Daily summary ─────────────────────────────────────────────────────────
 
     def get_summary(self) -> dict:
-        """Returns a human-readable daily summary dict."""
         starting = self.state.starting_balance
         current = self.state.current_balance
         pnl = current - starting
-        pnl_pct = pnl / starting * 100
+        pnl_pct = pnl / starting * 100 if starting > 0 else 0
 
         open_positions = [p for p in self.state.positions if p.status == "open"]
-        closed_positions = [p for p in self.state.positions if p.status == "closed"]
 
         return {
             "date": self.state.date,
@@ -221,24 +684,25 @@ class PnLTracker:
             "pnl": f"${pnl:+.2f}",
             "pnl_pct": f"{pnl_pct:+.1f}%",
             "trades_placed": self.state.trades_placed,
-            "trades_remaining": max(0, MAX_TRADES - self.state.trades_placed),
+            "trades_remaining": "unlimited",
             "open_positions": len(open_positions),
             "realized_pnl": f"${self.state.realized_pnl:+.2f}",
             "goal_met": self.state.goal_met,
             "trading_halted": self.state.trading_halted,
             "halt_reason": self.state.halt_reason,
+            "daily_brake_level": self.state.daily_brake_level,
             "profit_target": f"${starting * (1 + PROFIT_TARGET_PCT):.2f} (+5%)",
-            "stop_loss_level": f"${starting * (1 - STOP_LOSS_PCT):.2f} (-5%)",
+            "stop_loss_level": f"${starting * (1 - DAILY_BRAKE_HARD_PCT):.2f} (-5%)",
         }
 
     def format_summary(self) -> str:
-        """Returns a Telegram-ready summary string."""
         s = self.get_summary()
-        status = ""
         if s["goal_met"]:
             status = "GOAL MET - Trading paused"
         elif s["trading_halted"]:
             status = f"HALTED: {s['halt_reason']}"
+        elif s["daily_brake_level"] > 0:
+            status = f"BRAKE LVL {s['daily_brake_level']} — {s['halt_reason']}"
         else:
             status = "Active"
 
@@ -246,7 +710,7 @@ class PnLTracker:
             f"Daily P&L Summary — {s['date']}\n"
             f"Balance: {s['current_balance']} ({s['pnl']} / {s['pnl_pct']})\n"
             f"Target: {s['profit_target']} | Floor: {s['stop_loss_level']}\n"
-            f"Trades: {s['trades_placed']}/{MAX_TRADES} | Open positions: {s['open_positions']}\n"
+            f"Trades: {s['trades_placed']} | Open positions: {s['open_positions']}\n"
             f"Realized P&L: {s['realized_pnl']}\n"
             f"Status: {status}"
         )
