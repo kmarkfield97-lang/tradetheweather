@@ -23,7 +23,6 @@ def compute(liquidity: dict, our_prob: float, side: str) -> dict:
 
     # Imbalance ratio: >0 means more YES volume (smart money bullish)
     yes_frac = yes_volume / total_volume
-    no_frac = no_volume / total_volume
     imbalance = yes_frac - 0.5   # -0.5 to +0.5
 
     # Only act on significant imbalances

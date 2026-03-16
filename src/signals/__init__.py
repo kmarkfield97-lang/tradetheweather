@@ -16,6 +16,9 @@ class AggregatedSignal:
     active_signals: int = 0             # number of signals that fired
     model_uncertainty: float = 0.0      # higher = less confident
     notes: List[str] = field(default_factory=list)
+    suggested_cap: float = 0.20         # contextual adjustment cap selected by aggregator
+    cap_regime: str = "default"         # label for the cap regime chosen
+    weights_version: str = "fallback"   # version of signal_weights.json active at aggregation time
 
 
 __all__ = ["AggregatedSignal", "aggregator"]

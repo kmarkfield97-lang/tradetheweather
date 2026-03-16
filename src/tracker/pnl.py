@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
 
+from src.analysis.engine import SERIES_CITY_MAP
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "../../data")
@@ -72,6 +74,13 @@ STATE_LOCKED = "locked"
 STATE_NEAR_LOCKED = "near_locked"
 STATE_LIVE = "live"
 STATE_BROKEN = "broken"
+
+# ─── Correlated exposure caps ─────────────────────────────────────────────────
+# Fractions of starting_balance; enforced per city
+CITY_TEMP_EXPOSURE_PCT = 0.15       # max 15% in temp markets for one city
+CITY_PRECIP_EXPOSURE_PCT = 0.15     # max 15% in precip markets for one city
+CITY_TOTAL_EXPOSURE_PCT = 0.20      # max 20% in any single city across all types
+THRESHOLD_STACK_GAP_F = 3.0         # block new YES if existing YES within ±3°F same city/type
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -156,20 +165,13 @@ def _classify_position(
     Classify a position as locked / near_locked / live / broken.
 
     locked:      outcome effectively secured (already hit threshold or clearly lost)
-    near_locked: very high confidence (85%+ market price, <1hr left)
+    near_locked: high market confidence with corroborating time/obs context
     live:        still depends on future weather path
-    broken:      thesis invalidated by observations or trend
+    broken:      thesis invalidated by observations, trend, or timing
     """
     parsed = _parse_ticker(pos.ticker)
     threshold = parsed.get("threshold")
     market_type = parsed.get("market_type")
-
-    # near_locked: market is pricing very high confidence and time is short
-    if hours_left is not None and hours_left < 1.0:
-        if mark >= 90:
-            return STATE_NEAR_LOCKED
-        if mark <= 10:
-            return STATE_NEAR_LOCKED  # effectively lost
 
     if weather_report and market_type in ("temp_high", "temp_low") and threshold is not None:
         obs = weather_report.get("recent_observations", [])
@@ -178,12 +180,30 @@ def _classify_position(
         if obs:
             current_temp = obs[0].get("temp_f")
             if current_temp is not None:
-                gap = current_temp - threshold if market_type == "temp_high" else threshold - current_temp
-                # locked: already crossed threshold with little time left
-                if gap >= 0 and hours_left is not None and hours_left < 2.0:
-                    return STATE_LOCKED
+                gap = (
+                    current_temp - threshold
+                    if market_type == "temp_high"
+                    else threshold - current_temp
+                )
 
-                # broken: temp is far from threshold and time is short
+                # locked: threshold crossed AND either:
+                #   (a) less than 2h left, or
+                #   (b) crossed consistently across 3+ observations (early lock-in)
+                if gap >= 0:
+                    if hours_left is not None and hours_left < 2.0:
+                        return STATE_LOCKED
+                    # Check for persistent threshold crossing in multiple observations
+                    if len(obs) >= 3:
+                        temps = [o.get("temp_f") for o in obs[:3]]
+                        if all(t is not None for t in temps):
+                            all_crossed = all(
+                                (t >= threshold if market_type == "temp_high" else t <= threshold)
+                                for t in temps
+                            )
+                            if all_crossed:
+                                return STATE_LOCKED
+
+                # broken: temp is far from threshold with limited time
                 if gap < -THESIS_TEMP_DIVERGENCE_F and hours_left is not None and hours_left < 3.0:
                     return STATE_BROKEN
 
@@ -194,9 +214,69 @@ def _classify_position(
                         hours_left is not None and hours_left < 4.0):
                     return STATE_BROKEN
 
-    # near_locked: high market confidence regardless of weather data
-    if mark >= 88 or mark <= 12:
-        return STATE_NEAR_LOCKED
+                # broken: required warming rate is physically unrealistic (>5°F/hr needed)
+                if gap < 0 and hours_left is not None and hours_left > 0:
+                    required_rate = (-gap) / hours_left
+                    if required_rate > 5.0:
+                        return STATE_BROKEN
+
+    # near_locked: final window with very high/low market price
+    if hours_left is not None and hours_left < 1.0:
+        if mark >= 90 or mark <= 10:
+            return STATE_NEAR_LOCKED
+
+    # near_locked: high market confidence + time context
+    # Require hours_left < 3 or a large gap past threshold to avoid premature classification
+    if mark >= 88:
+        if hours_left is None or hours_left < 3.0:
+            return STATE_NEAR_LOCKED
+        # With > 3h left, require obs confirmation for near_locked
+        if weather_report and market_type in ("temp_high", "temp_low") and threshold is not None:
+            obs = weather_report.get("recent_observations", [])
+            if obs:
+                cur = obs[0].get("temp_f")
+                if cur is not None:
+                    gap = (
+                        cur - threshold
+                        if market_type == "temp_high"
+                        else threshold - cur
+                    )
+                    if gap >= 5.0:
+                        return STATE_NEAR_LOCKED
+        # No obs confirmation with > 3h left — stay as LIVE
+        return STATE_LIVE
+
+    if mark <= 12:
+        if hours_left is None or hours_left < 3.0:
+            return STATE_NEAR_LOCKED
+        return STATE_LIVE
+
+    # ── Rain/snow: thesis invalidation via precipitation timing slip ──────────
+    # If we're long YES on rain/snow but hourly precip has shifted outside the
+    # settlement window, the thesis may be broken.
+    if weather_report and market_type == "rain" and pos.side == "yes":
+        hourly = weather_report.get("hourly", [])
+        if hourly and hours_left is not None and hours_left < 4.0:
+            # Check if meaningful precip (>= 20%) exists within the window
+            window_hours = max(1, int(hours_left))
+            window_probs = [
+                h.get("precip_chance", 0) or 0
+                for h in hourly[:window_hours]
+            ]
+            max_in_window = max(window_probs) if window_probs else 0
+            # Check if precip that was expected has slipped beyond window
+            extended_probs = [
+                h.get("precip_chance", 0) or 0
+                for h in hourly[window_hours:window_hours + 4]
+            ]
+            max_extended = max(extended_probs) if extended_probs else 0
+            if max_in_window < 20 and max_extended >= 40:
+                # Precipitation slipped outside settlement window — thesis broken
+                logger.debug(
+                    f"RAIN_THESIS_SLIP {pos.ticker}: max precip in window {max_in_window}% "
+                    f"but {max_extended}% after window — broken"
+                )
+                return STATE_BROKEN
 
     return STATE_LIVE
 
@@ -210,48 +290,89 @@ def _model_hold_value(
 ) -> float:
     """
     Estimates the expected value (cents) of holding to settlement.
-    Accounts for settlement risk buffer and time decay of uncertainty.
+
+    Penalty terms (applied to implied_prob before converting to cents):
+      1. Settlement risk buffer (dynamic by market type)
+      2. Model uncertainty penalty (from entry-time signal aggregation)
+      3. Final-window volatility penalty (for live positions near close)
+      4. Required warming rate penalty (temp markets)
+
+    Returns EV in cents.
     """
     if state == STATE_LOCKED:
-        # Functionally resolved — hold value ≈ 100 minus tiny settlement risk
-        return 100 - (SETTLEMENT_RISK_BUFFER * 100 * 0.5)
+        # Functionally resolved — hold value ≈ 100 minus minimal settlement risk
+        return 100 - (0.02 * 100)  # 2% residual settlement uncertainty
 
     if state == STATE_BROKEN:
         # Thesis broken — hold value ≈ 0
-        return SETTLEMENT_RISK_BUFFER * 100
+        return 2.0  # 2¢ residual salvage value
 
     # Base: use current market price as unbiased estimate of settlement prob
     implied_prob = mark / 100.0
 
-    # Adjust for settlement risk (uncertainty about official reading)
-    if hours_left is not None and hours_left < 2.0:
-        # Final window: increase risk buffer due to last-mile uncertainty
-        risk_buffer = SETTLEMENT_RISK_BUFFER * FINAL_HOUR_CONSERVATISM
-    else:
-        risk_buffer = SETTLEMENT_RISK_BUFFER
-
-    # Weather trend adjustment
     parsed = _parse_ticker(pos.ticker)
     market_type = parsed.get("market_type")
     threshold = parsed.get("threshold")
+
+    # ── 1. Settlement risk buffer (market-type aware) ────────────────────────
+    # Rain/snow settlement has higher uncertainty (NWS gauge vs Kalshi station)
+    if market_type in ("rain", "snow"):
+        base_risk_buffer = 0.08
+    else:
+        base_risk_buffer = 0.04
+
+    # Final window adds additional uncertainty from last-mile station reporting
+    if hours_left is not None and hours_left < 2.0:
+        risk_buffer = base_risk_buffer * FINAL_HOUR_CONSERVATISM
+    else:
+        risk_buffer = base_risk_buffer
+
+    # ── 2. Model uncertainty penalty (stored at entry time) ──────────────────
+    model_unc = getattr(pos, "model_uncertainty", 0.3)
+    uncertainty_penalty = 0.05 * model_unc  # up to 0.05 reduction at max uncertainty
+
+    # ── 3. Final-window volatility penalty for live positions ─────────────────
+    volatility_penalty = 0.0
+    if state == STATE_LIVE and hours_left is not None and hours_left < 1.5:
+        volatility_penalty = 0.02  # 2¢ — late live positions have higher noise
+
+    # ── 4. Weather trend adjustment for temp markets ──────────────────────────
     if weather_report and market_type in ("temp_high", "temp_low") and threshold is not None:
-        trend = weather_report.get("temp_trend", 0) or 0
         obs = weather_report.get("recent_observations", [])
+        trend = weather_report.get("temp_trend")
         if obs and hours_left is not None:
             current_temp = obs[0].get("temp_f")
             if current_temp is not None:
-                gap = current_temp - threshold if market_type == "temp_high" else threshold - current_temp
-                # Positive gap = already past threshold (good), negative = still needs to move
-                warming_needed = -gap
-                hrs_remaining = max(hours_left, 0.1)
-                required_rate = warming_needed / hrs_remaining
-                # If required warming rate is unrealistic (>3°F/hr) reduce hold value
-                if required_rate > 3.0:
-                    implied_prob = max(0.02, implied_prob - 0.15)
-                elif required_rate > 1.5:
-                    implied_prob = max(0.05, implied_prob - 0.07)
+                gap = (
+                    current_temp - threshold
+                    if market_type == "temp_high"
+                    else threshold - current_temp
+                )
+                if gap >= 0:
+                    # Threshold already crossed — apply trend penalty if cooling against us
+                    if trend is not None:
+                        if (market_type == "temp_high" and trend < -1.0) or \
+                                (market_type == "temp_low" and trend > 1.0):
+                            implied_prob = max(0.05, implied_prob - 0.08)
+                else:
+                    warming_needed = -gap
+                    hrs_remaining = max(hours_left, 0.1)
+                    required_rate = warming_needed / hrs_remaining
+                    if required_rate > 3.0:
+                        implied_prob = max(0.02, implied_prob - 0.15)
+                    elif required_rate > 1.5:
+                        implied_prob = max(0.05, implied_prob - 0.07)
 
-    adjusted_prob = max(0.01, min(0.99, implied_prob - risk_buffer))
+    total_penalty_pct = risk_buffer + uncertainty_penalty + volatility_penalty
+    adjusted_prob = max(0.01, min(0.99, implied_prob * (1.0 - total_penalty_pct)))
+
+    logger.debug(
+        f"hold_ev {pos.ticker}: mark={mark}¢ state={state} "
+        f"implied={implied_prob:.3f} risk_buf={risk_buffer:.3f} "
+        f"unc_pen={uncertainty_penalty:.3f} vol_pen={volatility_penalty:.3f} "
+        f"→ adjusted={adjusted_prob:.3f} ev={adjusted_prob * 100:.1f}¢"
+    )
+
     return adjusted_prob * 100
 
 
@@ -273,6 +394,7 @@ class Position:
     trimmed_contracts: int = 0              # contracts already exited via staged trim
     city: str = ""                          # city key (e.g. "NYC", "DENVER")
     market_type: str = ""                   # "temp_high" / "temp_low" / "rain" / "snow"
+    model_uncertainty: float = 0.3          # from signal aggregation at entry time (0–1)
 
 
 @dataclass
@@ -287,6 +409,7 @@ class DailyState:
     goal_met: bool = False
     realized_pnl: float = 0.0
     daily_brake_level: int = 0   # 0=none, 1=soft(-3%), 2=medium(-4%), 3=hard(-5%)
+    goal_exception_trades: int = 0  # trades allowed past +5% goal (max 2/day)
 
 
 # ─── PnLTracker ──────────────────────────────────────────────────────────────
@@ -382,26 +505,166 @@ class PnLTracker:
 
         elif pnl_pct <= -DAILY_BRAKE_MEDIUM_PCT and self.state.daily_brake_level < 2:
             self.state.daily_brake_level = 2
+            self.state.trading_halted = True
+            self.state.halt_reason = f"Daily brake medium: new entries disabled ({pnl_pct * 100:.1f}%)"
             logger.warning(f"Daily brake MEDIUM: {pnl_pct * 100:.1f}% drawdown — tightening exits")
+            self._save()
 
         elif pnl_pct <= -DAILY_BRAKE_SOFT_PCT and self.state.daily_brake_level < 1:
             self.state.daily_brake_level = 1
             self.state.trading_halted = True
             self.state.halt_reason = f"Daily brake soft: new entries disabled ({pnl_pct * 100:.1f}%)"
             logger.warning(f"Daily brake SOFT: {pnl_pct * 100:.1f}% drawdown — new entries disabled")
+            self._save()
 
     def can_trade(self) -> tuple[bool, str]:
         if self.state.trading_halted:
             return False, self.state.halt_reason
-        reserve = self.state.current_balance * MIN_CASH_RESERVE_PCT
+        # Reserve is anchored to starting_balance, not current_balance.
+        # (Using current_balance * 0.20 would make the check always False.)
+        reserve = self.state.starting_balance * MIN_CASH_RESERVE_PCT
         if self.state.current_balance <= reserve:
             return False, f"Balance ${self.state.current_balance:.2f} at or below 20% cash reserve (${reserve:.2f})"
         return True, ""
+
+    def is_high_conviction_exception(self, rec) -> bool:
+        """
+        Returns True if a trade qualifies for a narrow bypass past the daily profit halt.
+        Requirements (all must hold):
+          - goal_met = True, daily_brake_level = 0 (positive day, no drawdown)
+          - Under 2 exception trades already used today
+          - rec.confidence == "high" and rec.edge >= 0.18
+          - No existing open position in the same city + market_type (no correlation)
+        """
+        if not self.state.goal_met:
+            return False
+        if self.state.daily_brake_level > 0:
+            return False
+        if self.state.goal_exception_trades >= 2:
+            return False
+
+        confidence = getattr(rec, "confidence", "") or ""
+        edge = getattr(rec, "edge", 0.0) or 0.0
+        if confidence != "high" or edge < 0.18:
+            return False
+
+        city = getattr(rec, "city", "") or ""
+        mtype = getattr(rec, "market_type", "") or ""
+        for pos in self.state.positions:
+            if pos.status == "open" and pos.city == city and pos.market_type == mtype:
+                return False  # correlated position already open
+
+        return True
+
+    def record_goal_exception(self):
+        """Increment exception trade counter and persist."""
+        self.state.goal_exception_trades += 1
+        self._save()
 
     def validate_position_size(self, cost_dollars: float) -> tuple[bool, str]:
         max_allowed = self.state.starting_balance * MAX_POSITION_PCT
         if cost_dollars > max_allowed:
             return False, f"Position size ${cost_dollars:.2f} exceeds 20% limit (${max_allowed:.2f})"
+        return True, ""
+
+    def get_exposure_summary(self) -> dict:
+        """
+        Returns per-city exposure breakdown across open positions.
+        Used by check_correlation_limits() to enforce correlated exposure caps.
+        """
+        city_temp: dict[str, float] = {}
+        city_precip: dict[str, float] = {}
+        city_thresholds: dict[str, list] = {}  # city:market_type -> [threshold, ...]
+
+        for pos in self.state.positions:
+            if pos.status != "open":
+                continue
+            city = pos.city or ""
+            mtype = pos.market_type or ""
+            cost = pos.cost_dollars
+
+            if mtype in ("temp_high", "temp_low"):
+                city_temp[city] = city_temp.get(city, 0.0) + cost
+            elif mtype in ("rain", "snow"):
+                city_precip[city] = city_precip.get(city, 0.0) + cost
+
+            # Track thresholds for stack-exposure check
+            parsed = _parse_ticker(pos.ticker)
+            thresh = parsed.get("threshold")
+            if thresh is not None and city and mtype:
+                key = f"{city}:{mtype}"
+                city_thresholds.setdefault(key, []).append((thresh, pos.side))
+
+        return {
+            "city_temp_exposure": city_temp,
+            "city_precip_exposure": city_precip,
+            "city_thresholds": city_thresholds,
+        }
+
+    def check_correlation_limits(self, rec) -> tuple[bool, str]:
+        """
+        Enforces correlated exposure caps before entering a new position.
+        rec must have: .city, .market_type, .cost_dollars, .side, and
+        a .market_price attribute (used for threshold-stack check via .ticker).
+        Returns (allowed: bool, reason: str).
+        """
+        city = getattr(rec, "city", "") or ""
+        mtype = getattr(rec, "market_type", "") or ""
+        cost = getattr(rec, "cost_dollars", 0.0)
+        side = getattr(rec, "side", "yes")
+        base = self.state.starting_balance
+        if base <= 0:
+            return True, ""
+
+        exp = self.get_exposure_summary()
+
+        # City-level temperature cap
+        if mtype in ("temp_high", "temp_low"):
+            current_temp = exp["city_temp_exposure"].get(city, 0.0)
+            limit = base * CITY_TEMP_EXPOSURE_PCT
+            if current_temp + cost > limit:
+                return False, (
+                    f"city temp exposure limit: {city} would be "
+                    f"${current_temp + cost:.2f} > ${limit:.2f} cap"
+                )
+
+        # City-level precipitation cap
+        if mtype in ("rain", "snow"):
+            current_precip = exp["city_precip_exposure"].get(city, 0.0)
+            limit = base * CITY_PRECIP_EXPOSURE_PCT
+            if current_precip + cost > limit:
+                return False, (
+                    f"city precip exposure limit: {city} would be "
+                    f"${current_precip + cost:.2f} > ${limit:.2f} cap"
+                )
+
+        # Total city exposure cap (temp + precip combined)
+        total_temp = exp["city_temp_exposure"].get(city, 0.0)
+        total_precip = exp["city_precip_exposure"].get(city, 0.0)
+        total_city = total_temp + total_precip + cost
+        total_limit = base * CITY_TOTAL_EXPOSURE_PCT
+        if total_city > total_limit:
+            return False, (
+                f"total city exposure limit: {city} would be "
+                f"${total_city:.2f} > ${total_limit:.2f} cap"
+            )
+
+        # Threshold-stack check: block new YES if already long a YES on same city/type
+        # within ±THRESHOLD_STACK_GAP_F of this threshold
+        if side == "yes" and mtype in ("temp_high", "temp_low"):
+            rec_parsed = _parse_ticker(getattr(rec, "ticker", ""))
+            new_thresh = rec_parsed.get("threshold")
+            if new_thresh is not None:
+                key = f"{city}:{mtype}"
+                for existing_thresh, existing_side in exp["city_thresholds"].get(key, []):
+                    if (existing_side == "yes" and
+                            abs(existing_thresh - new_thresh) < THRESHOLD_STACK_GAP_F):
+                        return False, (
+                            f"threshold stack: {city} {mtype} already long YES "
+                            f"@{existing_thresh}°F within {THRESHOLD_STACK_GAP_F}°F of "
+                            f"new @{new_thresh}°F"
+                        )
+
         return True, ""
 
     # ── Per-position exit evaluation ──────────────────────────────────────────
@@ -464,7 +727,7 @@ class PnLTracker:
                 pos.high_water_mark = mark
                 self._save()
 
-            hwm = pos.high_water_mark or pos.entry_price
+            hwm = pos.high_water_mark if pos.high_water_mark is not None else pos.entry_price
 
             # ── Classify position state ───────────────────────────────────────
             state = _classify_position(pos, mark, hours_left, weather_report)
@@ -473,17 +736,20 @@ class PnLTracker:
             hold_ev = _model_hold_value(pos, mark, state, hours_left, weather_report)
             exit_ev = mark - SLIPPAGE_CENTS - FEE_CENTS
 
-            # Apply final-hour conservatism (favor exiting if not locked)
-            if hours_left is not None and hours_left < 1.0 and state not in (STATE_LOCKED, STATE_NEAR_LOCKED):
-                exit_ev_adj = exit_ev * FINAL_HOUR_CONSERVATISM
-            else:
-                exit_ev_adj = exit_ev
+            # Apply final-window conservatism (make hold less attractive vs exiting).
+            # Discount hold EV in final window for live positions to favor exiting.
+            if hours_left is not None and hours_left < 0.5 and state == STATE_LIVE:
+                hold_ev = hold_ev * 0.80   # very final window: strongly discount hold
+            elif hours_left is not None and hours_left < 1.0 and state not in (STATE_LOCKED, STATE_NEAR_LOCKED):
+                hold_ev = hold_ev / FINAL_HOUR_CONSERVATISM
+            exit_ev_adj = exit_ev
 
             # ── Detailed decision log ─────────────────────────────────────────
+            hrs_display = f"{hours_left:.1f}" if hours_left is not None else "N/A"
             logger.info(
                 f"EXIT_EVAL {pos.ticker} {pos.side.upper()} | "
                 f"entry={pos.entry_price}¢ mark={mark}¢ peak={hwm}¢ | "
-                f"state={state} hrs_left={hours_left:.1f if hours_left else 'N/A'} | "
+                f"state={state} hrs_left={hrs_display} | "
                 f"hold_ev={hold_ev:.1f}¢ exit_ev={exit_ev_adj:.1f}¢ | "
                 f"pnl=${((mark - pos.entry_price) / 100 * remaining):+.2f} contracts={remaining}"
             )
@@ -504,7 +770,13 @@ class PnLTracker:
             # ── Priority 3: Staged profit-taking ─────────────────────────────
             elif mark >= PROFIT_TAKE_BANDS[0][0]:  # at or above lowest band (70¢)
                 is_locked = state in (STATE_LOCKED, STATE_NEAR_LOCKED)
-                trim_frac = _staged_trim_fraction(mark, is_locked)
+                # near_locked: suppress trimming at 70–95¢ so position can run to
+                # full settlement. Only the 96–99¢ band trim is allowed to reduce
+                # last-mile slippage risk.
+                if state == STATE_NEAR_LOCKED and mark <= 95:
+                    trim_frac = 0.0
+                else:
+                    trim_frac = _staged_trim_fraction(mark, is_locked)
                 if trim_frac > 0:
                     trim_count = max(1, math.floor(remaining * trim_frac))
                     # Only trim if we haven't already trimmed this band
@@ -547,18 +819,6 @@ class PnLTracker:
         """Infer city name from ticker prefix using engine's series map."""
         try:
             t = ticker.upper()
-            SERIES_CITY_MAP = {
-                "KXHIGHTPHX": "PHOENIX", "KXHIGHTHOU": "HOUSTON", "KXHIGHTMIN": "MINNEAPOLIS",
-                "KXHIGHTDAL": "DALLAS", "KXHIGHTLV": "LAS_VEGAS", "KXHIGHTSATX": "SAN_ANTONIO",
-                "KXHIGHTBOS": "BOSTON", "KXHIGHTNOLA": "NEW_ORLEANS", "KXHIGHTSFO": "SAN_FRANCISCO",
-                "KXHIGHTSEA": "SEATTLE", "KXHIGHTDC": "DC",
-                "KXHIGHTATL": "ATLANTA", "KXHIGHTOKC": "OKLAHOMA_CITY",
-                "KXLOWTCHI": "CHICAGO", "KXLOWTDEN": "DENVER", "KXLOWTNYC": "NYC",
-                "KXLOWTPHIL": "PHILADELPHIA", "KXLOWTMIA": "MIAMI", "KXLOWTLAX": "LOS_ANGELES",
-                "KXLOWTAUS": "AUSTIN",
-                "KXRAINNYC": "NYC", "KXRAINHOU": "HOUSTON", "KXRAINCHIM": "CHICAGO",
-                "KXRAINSEA": "SEATTLE",
-            }
             for prefix, city in SERIES_CITY_MAP.items():
                 if t.startswith(prefix):
                     return city
@@ -570,7 +830,8 @@ class PnLTracker:
 
     def record_trade(self, ticker: str, order_id: str, side: str,
                      contracts: int, entry_price: int, cost_dollars: float,
-                     city: str = "", market_type: str = ""):
+                     city: str = "", market_type: str = "",
+                     model_uncertainty: float = 0.3):
         pos = Position(
             ticker=ticker,
             order_id=order_id,
@@ -582,6 +843,7 @@ class PnLTracker:
             placed_at=datetime.now(timezone.utc).isoformat(),
             city=city,
             market_type=market_type,
+            model_uncertainty=model_uncertainty,
         )
         self.state.positions.append(pos)
         self.state.trades_placed += 1
