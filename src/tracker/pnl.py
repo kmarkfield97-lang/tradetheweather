@@ -467,9 +467,20 @@ class PnLTracker:
         self._check_rules()
         self._save()
 
+    def _portfolio_value(self) -> float:
+        """
+        Returns total portfolio value: cash balance + cost basis of open positions.
+        Open position dollars are tied up in contracts, not reflected in cash balance,
+        so we add them back to get a true picture of account value.
+        """
+        open_cost = sum(
+            p.cost_dollars for p in self.state.positions if p.status == "open"
+        )
+        return self.state.current_balance + open_cost
+
     def _check_rules(self):
         starting = self.state.starting_balance
-        current = self.state.current_balance
+        current = self._portfolio_value()
         if starting <= 0:
             return
 
@@ -933,7 +944,7 @@ class PnLTracker:
 
     def get_summary(self) -> dict:
         starting = self.state.starting_balance
-        current = self.state.current_balance
+        current = self._portfolio_value()
         pnl = current - starting
         pnl_pct = pnl / starting * 100 if starting > 0 else 0
 
