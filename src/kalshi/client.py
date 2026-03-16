@@ -4,6 +4,7 @@ Docs: https://trading-api.readme.io/reference
 """
 
 import os
+import re
 import time
 import base64
 from datetime import datetime, timezone
@@ -63,8 +64,7 @@ class KalshiClient:
                     if in_key:
                         stripped = line.strip()
                         # Stop when we hit next env var: ALL_CAPS_NAME= at line start
-                        import re as _re
-                        if _re.match(r'^[A-Z][A-Z0-9_]+=', stripped):
+                        if re.match(r'^[A-Z][A-Z0-9_]+=', stripped):
                             break
                         lines.append(stripped)
                         if stripped.startswith("-----END"):
@@ -240,7 +240,7 @@ class KalshiClient:
         if best_no is None and best_yes is not None:
             best_no = 100 - best_yes
 
-        spread = (best_yes + best_no - 100) if (best_yes and best_no) else None
+        spread = (best_yes + best_no - 100) if (best_yes is not None and best_no is not None) else None
 
         return {
             "ticker": ticker,
@@ -289,7 +289,17 @@ class KalshiClient:
     def exit_position(self, ticker: str, side: str, count: int, price: int) -> dict:
         """
         Exits a position by placing an opposite order.
-        e.g. if you hold YES contracts, sell them by buying NO.
+        - YES position: sell YES by buying NO. `price` is the YES bid (e.g. 75¢).
+          place_order receives side="no", yes_price = 100 - 75 = 25¢. Correct.
+        - NO position: sell NO by buying YES. `price` is the NO bid (e.g. 40¢).
+          We need to buy YES at the YES ask = 100 - 40 = 60¢, so pass 60 to place_order
+          with side="yes" so yes_price = 60¢. Without this conversion the limit order
+          would rest at the wrong price and never fill.
         """
-        exit_side = "no" if side == "yes" else "yes"
-        return self.place_order(ticker, exit_side, count, price)
+        if side == "yes":
+            exit_side = "no"
+            exit_price = price        # price is the YES bid; place_order sets yes_price = 100 - price
+        else:
+            exit_side = "yes"
+            exit_price = 100 - price  # price is the NO bid; convert to YES ask for place_order
+        return self.place_order(ticker, exit_side, count, exit_price)

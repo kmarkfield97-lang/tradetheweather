@@ -38,12 +38,15 @@ def compute(report: dict, threshold: float, market_type: str) -> dict:
     recent = relevant[-14:]  # last 2 weeks
     mean_bias = sum(recent) / len(recent)
 
-    # mean_bias > 0 means NWS runs too warm → actual temps tend to be lower
-    # For temp_high: positive bias → actual high < forecast → YES less likely
-    # So a warm bias decreases our YES probability
-    if market_type in ("temp_high", "temp_low"):
-        # bias = forecast - actual; if positive, actual is lower → less likely to hit high threshold
+    # mean_bias = forecast - actual; positive means NWS runs warm → actual temps tend to be lower
+    if market_type == "temp_high":
+        # For temp_high: warm bias → actual high < forecast → YES (high exceeds threshold) less likely
         adj = -mean_bias / 3.0 * 0.04   # cap at ~0.10 for 7.5°F bias
+        adj = max(-0.10, min(0.10, adj))
+    elif market_type == "temp_low":
+        # For temp_low: YES wins when actual low <= threshold.
+        # Warm bias → actual low tends to be lower than forecast → easier to hit threshold → YES more likely
+        adj = mean_bias / 3.0 * 0.04   # sign inverted vs temp_high
         adj = max(-0.10, min(0.10, adj))
     else:
         adj = 0.0  # bias not meaningful for rain/snow in same way

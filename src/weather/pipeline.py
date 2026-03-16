@@ -66,7 +66,8 @@ class WeatherPipeline:
         try:
             resp = self.http.get(url)
             resp.raise_for_status()
-            periods = resp.json()["properties"]["periods"]
+            props = resp.json()["properties"]
+            periods = props["periods"]
             # NWS periods alternate daytime/nighttime.
             # If periods[0] is nighttime (after ~6 PM), high is in periods[1],
             # and tonight's low is in periods[0].
@@ -77,15 +78,23 @@ class WeatherPipeline:
             if p0.get("isDaytime"):
                 today = p0
                 tonight = p1
+                high_temp_f = today.get("temperature")
             else:
                 # Already past daytime — tonight IS periods[0], tomorrow day is periods[1]
-                today = p1  # tomorrow's daytime (still useful for high)
+                # Do NOT use tomorrow's high as today's: same-day high markets have settled.
+                today = p1
                 tonight = p0
+                high_temp_f = None  # today's daytime period is gone; no valid high forecast
+            # Use the actual NWS generation time so forecast freshness checks work correctly.
+            # NWS provides generatedAt and updateTime; prefer updateTime as it reflects the
+            # most recent model run. Fall back to generatedAt, then to now() as last resort.
+            nws_generated_at = props.get("updateTime") or props.get("generatedAt") or datetime.now(timezone.utc).isoformat()
             return {
                 "city": city,
                 "date": date.today().isoformat(),
+                "generated_at": nws_generated_at,
                 "daytime_name": today.get("name"),
-                "high_temp_f": today.get("temperature") if today.get("isDaytime") else None,
+                "high_temp_f": high_temp_f,
                 "low_temp_f": tonight.get("temperature"),
                 "precip_chance": today.get("probabilityOfPrecipitation", {}).get("value", 0),
                 "wind_speed": today.get("windSpeed"),
@@ -107,16 +116,19 @@ class WeatherPipeline:
             resp = self.http.get(url)
             resp.raise_for_status()
             periods = resp.json()["properties"]["periods"][:24]
-            return [
-                {
+            result = []
+            for p in periods:
+                dp_c = p.get("dewpoint", {}).get("value")
+                dp_f = round(dp_c * 9 / 5 + 32, 1) if dp_c is not None else None
+                result.append({
                     "time": p["startTime"],
                     "temp_f": p["temperature"],
+                    "dewpoint_f": dp_f,
                     "precip_chance": p.get("probabilityOfPrecipitation", {}).get("value", 0),
                     "wind_speed": p.get("windSpeed"),
                     "short_forecast": p.get("shortForecast"),
-                }
-                for p in periods
-            ]
+                })
+            return result
         except Exception:
             return []
 

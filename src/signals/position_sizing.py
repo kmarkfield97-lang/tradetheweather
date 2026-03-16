@@ -24,9 +24,8 @@ def compute(
     # Basic Kelly criterion
     prob_win = our_prob if side == "yes" else (1.0 - our_prob)
     prob_lose = 1.0 - prob_win
-    odds = (100 - price) / price   # net payout per dollar if we win
 
-    if odds <= 0 or prob_win <= 0:
+    if price <= 0 or price >= 100 or prob_win <= 0:
         return {
             "position_dollars": 0.0,
             "kelly_raw": 0.0,
@@ -36,6 +35,7 @@ def compute(
             "exposure_multiplier": 0.0,
         }
 
+    odds = (100 - price) / price   # net payout per dollar if we win
     kelly_raw = (prob_win * odds - prob_lose) / odds
     kelly_raw = max(0.0, kelly_raw)
 
@@ -72,9 +72,12 @@ def compute(
         * uncertainty_penalty
     )
 
-    # Hard caps: minimum $1, maximum 20% of daily budget
+    # Caps: maximum 20% of daily budget.
+    # Minimum is relative to account size (1% of budget, floor $0.10) to avoid
+    # overriding Kelly on small accounts with a fixed-dollar floor.
     max_position = daily_budget * 0.20
-    position_dollars = max(1.0, min(position_dollars, max_position))
+    min_position = max(0.10, daily_budget * 0.01)
+    position_dollars = max(min_position, min(position_dollars, max_position))
     position_dollars = round(position_dollars, 2)
 
     return {

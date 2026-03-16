@@ -15,8 +15,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from src.kalshi.client import KalshiClient
 from src.weather.pipeline import WeatherPipeline
 from src.analysis.engine import TradeAnalysisEngine
+from src.analysis.advisor import run_advisor_session
+from src.analysis.uncertainty_recalibrator import run_recalibration_session
 from src.tracker.pnl import PnLTracker
-from src.tracker.history import DailyHistoryTracker
+from src.tracker.history import DailyHistoryTracker, _get_season_for_date
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,10 @@ class Orchestrator:
         # Maps exit order_id -> (position, exit_price_cents, contracts_to_exit)
         self._pending_exits: dict = {}
         self.started_at = datetime.now(timezone.utc)
+        # Scan coordination
+        self._scan_lock = asyncio.Lock()
+        # Snapshot for fast-scan change detection: city -> {last_obs_time, forecast_age_h}
+        self._last_scan_snapshot: dict = {}
 
     def set_bot(self, bot):
         self.bot = bot
@@ -86,13 +92,22 @@ class Orchestrator:
             name="Balance refresh + fill check",
         )
 
-        # Market scan every 30 minutes
+        # Market scan every 10 minutes (full)
         self.scheduler.add_job(
             self._scan_job,
             "interval",
             minutes=SCAN_INTERVAL_MINUTES,
             id="scan_job",
             name="Market scan",
+        )
+
+        # Fast event-driven scan every 2 minutes (targeted: final-window + fresh data only)
+        self.scheduler.add_job(
+            self._fast_scan_job,
+            "interval",
+            minutes=2,
+            id="fast_scan",
+            name="Fast signal scan",
         )
 
         # End-of-day close at 5pm PT
@@ -137,6 +152,19 @@ class Orchestrator:
             timezone="America/Los_Angeles",
             id="morning_briefing",
             name="Morning briefing",
+        )
+
+        # Uncertainty recalibration — weekly on Sunday at 2am PT
+        # Runs after settlement errors have accumulated during the week.
+        self.scheduler.add_job(
+            self._uncertainty_recalibration_job,
+            "cron",
+            day_of_week="sun",
+            hour=2,
+            minute=0,
+            timezone="America/Los_Angeles",
+            id="uncertainty_recal",
+            name="Uncertainty recalibration",
         )
 
         # Startup scan 15 seconds from now
@@ -201,7 +229,7 @@ class Orchestrator:
                         # Filled immediately — record and notify
                         self.tracker.record_exit(position.order_id, exit_price, pnl, contracts_to_exit)
                         reconciled = await self._reconcile_exit(
-                            position.ticker, position.side, contracts_to_exit, contracts_to_exit
+                            position.ticker, position.side, position.contracts, contracts_to_exit
                         )
                         msg = (
                             f"{'Partial exit' if is_partial else 'Profit take'}: {position.ticker} {position.side.upper()} "
@@ -269,13 +297,132 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     async def _scan_job(self):
-        """Run a market scan with a 120-second timeout."""
+        """Run a full market scan with a 180-second timeout, protected by scan lock."""
+        if not self._scan_lock.locked():
+            try:
+                async with self._scan_lock:
+                    await asyncio.wait_for(self.run_scan(), timeout=180)
+            except asyncio.TimeoutError:
+                logger.warning("Market scan timed out after 180s")
+            except Exception as e:
+                logger.error(f"Scan job error: {e}")
+        else:
+            logger.debug("Full scan skipped: scan already in progress")
+
+    async def _fast_scan_job(self):
+        """
+        Lightweight 2-minute scan targeting high-signal events only:
+          - Final-window markets (< 3h to close)
+          - Cities with fresh forecast updates (detected via snapshot diff)
+          - Cities with new METAR observations since last scan
+        Skips full evaluation if trading is halted. Uses scan lock to prevent overlap.
+        """
+        if self.tracker.state.trading_halted:
+            return
+        if not self._scan_lock.locked():
+            try:
+                async with self._scan_lock:
+                    await asyncio.wait_for(self._run_fast_scan(), timeout=45)
+            except asyncio.TimeoutError:
+                logger.warning("Fast scan timed out after 45s")
+            except Exception as e:
+                logger.error(f"Fast scan job error: {e}")
+        else:
+            logger.debug("Fast scan skipped: full scan in progress")
+
+    async def _run_fast_scan(self):
+        """
+        Determines which cities have fresh signals and triggers a targeted full scan
+        for those specific markets only. Updates _last_scan_snapshot.
+        """
+        now_utc = datetime.now(timezone.utc)
+        hot_cities: set = set()
+
+        # Always include cities with open positions that have < 3h left (final window)
+        for pos in self.tracker.state.positions:
+            if pos.status != "open":
+                continue
+            if pos.city:
+                try:
+                    market_data = self.kalshi.get_market(pos.ticker) or {}
+                    ct_str = market_data.get("market", {}).get("close_time") or ""
+                    if ct_str:
+                        ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                        if (ct - now_utc).total_seconds() < 3 * 3600:
+                            hot_cities.add(pos.city)
+                except Exception:
+                    pass
+
+        # Check for fresh data changes vs last snapshot
+        for city, snap in list(self._last_scan_snapshot.items()):
+            try:
+                report = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda c=city: self.weather.get_full_report(c)
+                )
+                obs = report.get("recent_observations", [])
+                new_obs_time = obs[0].get("timestamp", "") if obs else ""
+                last_obs_time = snap.get("last_obs_time", "")
+
+                fc_generated = report.get("forecast", {}).get("generated_at", "")
+                last_fc = snap.get("last_forecast_generated", "")
+
+                obs_changed = new_obs_time != last_obs_time and new_obs_time
+                fc_changed = fc_generated != last_fc and fc_generated
+
+                if obs_changed or fc_changed:
+                    hot_cities.add(city)
+                    logger.debug(
+                        f"Fast scan hot: {city} "
+                        f"obs_changed={obs_changed} fc_changed={fc_changed}"
+                    )
+
+                # Update snapshot
+                self._last_scan_snapshot[city] = {
+                    "last_obs_time": new_obs_time,
+                    "last_forecast_generated": fc_generated,
+                }
+            except Exception:
+                pass
+
+        if not hot_cities:
+            logger.debug("Fast scan: no hot cities detected")
+            return
+
+        logger.info(f"Fast scan: hot cities={hot_cities} — running targeted evaluation")
+
+        # Run a targeted full scan (engine handles per-market filtering)
+        daily_budget = self.tracker.state.current_balance
+        trades_used = self.tracker.state.trades_placed
+        open_position_cost = sum(
+            p.cost_dollars for p in self.tracker.state.positions if p.status == "open"
+        )
         try:
-            await asyncio.wait_for(self.run_scan(), timeout=120)
-        except asyncio.TimeoutError:
-            logger.warning("Market scan timed out after 120s")
+            recommendations = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.analysis.get_recommendations(
+                    daily_budget, trades_used, open_position_cost
+                ),
+            )
         except Exception as e:
-            logger.error(f"Scan job error: {e}")
+            logger.error(f"Fast scan recommendations error: {e}")
+            return
+
+        # Filter recommendations to hot cities only
+        hot_recs = [r for r in recommendations if r.city in hot_cities]
+        logger.info(f"Fast scan: {len(hot_recs)} hot recommendations from {hot_cities}")
+
+        for rec in hot_recs:
+            can, reason = self.tracker.can_trade()
+            if not can:
+                if self.tracker.state.goal_met and self.tracker.is_high_conviction_exception(rec):
+                    self.tracker.record_goal_exception()
+                else:
+                    break
+            corr_ok, corr_reason = self.tracker.check_correlation_limits(rec)
+            if not corr_ok:
+                logger.info(f"Fast scan SKIPPED {rec.ticker}: {corr_reason}")
+                continue
+            await self.execute_trade(rec)
 
     async def run_scan(self):
         """
@@ -301,16 +448,55 @@ class Orchestrator:
 
         logger.info(f"Scan found {len(recommendations)} recommendations.")
 
+        # Update fast-scan snapshot with cities from current recommendations
+        now_utc = datetime.now(timezone.utc)
+        for rec in recommendations:
+            city = rec.city
+            if city and city not in self._last_scan_snapshot:
+                self._last_scan_snapshot[city] = {
+                    "last_obs_time": "",
+                    "last_forecast_generated": "",
+                }
+
         for rec in recommendations:
             can, reason = self.tracker.can_trade()
             if not can:
-                logger.info(f"Trading halted: {reason}")
-                break
+                # Check for high-conviction exception past daily profit halt
+                if self.tracker.state.goal_met and self.tracker.is_high_conviction_exception(rec):
+                    logger.info(
+                        f"Goal-exception trade: {rec.ticker} qualifies "
+                        f"(edge={rec.edge:.3f}, confidence={rec.confidence})"
+                    )
+                    self.tracker.record_goal_exception()
+                else:
+                    logger.info(f"Trading halted: {reason}")
+                    break
+
+            # Correlated exposure check
+            corr_ok, corr_reason = self.tracker.check_correlation_limits(rec)
+            if not corr_ok:
+                logger.info(f"SKIPPED {rec.ticker}: correlation limit — {corr_reason}")
+                continue
+
             await self.execute_trade(rec)
 
     async def execute_trade(self, rec):
         """Places an order for a recommendation and records it."""
         try:
+            # Prevent duplicate orders: skip if a resting order already exists for this ticker
+            try:
+                resting = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.kalshi.get_orders(status="resting")
+                )
+                resting_orders = resting if isinstance(resting, list) else resting.get("orders", [])
+                if any(o.get("ticker") == rec.ticker for o in resting_orders):
+                    logger.info(
+                        f"SKIP_DUPLICATE {rec.ticker}: resting order already exists — skipping to prevent duplicate"
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"Could not check resting orders before trade ({rec.ticker}): {e}")
+
             order_resp = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.kalshi.place_order(
@@ -332,6 +518,7 @@ class Orchestrator:
                 cost_dollars=rec.cost_dollars,
                 city=rec.city,
                 market_type=rec.market_type,
+                model_uncertainty=getattr(rec, "model_uncertainty", 0.3),
             )
 
             logger.info(
@@ -354,7 +541,7 @@ class Orchestrator:
     async def _end_of_day_close_job(self):
         """
         Records day history, analyzes the day, records settlement errors,
-        sends EOD report and learning analysis.
+        runs the structured advisor, sends EOD report and learning analysis.
         """
         logger.info("Running end-of-day close job...")
 
@@ -370,11 +557,40 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Error analyzing day: {e}")
 
+        # Alert immediately on any P0 findings before anything else
+        p0_count = day_analysis.get("p0_count", 0)
+        if p0_count > 0 and self.bot:
+            try:
+                await self.bot.send_alert(
+                    f"[P0 ALERT] {p0_count} P0 finding(s) detected in today's trades. "
+                    f"Review structured_lessons in learning_log.json immediately."
+                )
+            except Exception as e:
+                logger.error(f"Error sending P0 alert: {e}")
+
         # Record settlement errors
         try:
             await self._record_settlement_errors()
         except Exception as e:
             logger.error(f"Error recording settlement errors: {e}")
+
+        # Run structured advisor (data-driven — no external LLM call)
+        try:
+            advisor_recs = await asyncio.get_event_loop().run_in_executor(
+                None, run_advisor_session
+            )
+            # Alert on any P0 advisor findings requiring immediate action
+            p0_recs = [r for r in advisor_recs if r.severity == "P0"]
+            if p0_recs and self.bot:
+                for rec in p0_recs[:3]:  # cap at 3 alerts
+                    await self.bot.send_alert(
+                        f"[ADVISOR P0] {rec.title}\n"
+                        f"Action: {rec.recommended_action}\n"
+                        f"Auto-apply: {rec.auto_apply_allowed}\n"
+                        f"{rec.proposed_change_summary[:300]}"
+                    )
+        except Exception as e:
+            logger.error(f"Error running advisor session: {e}")
 
         # Send EOD report
         try:
@@ -397,7 +613,7 @@ class Orchestrator:
         forecast. Saves errors to data/forecast_errors.json.
         """
         yesterday = (date.today() - timedelta(days=1)).isoformat()
-        season = _get_season(date.today())
+        season = _get_season_for_date(date.today().isoformat())
 
         # Load existing errors
         try:
@@ -517,6 +733,31 @@ class Orchestrator:
             json.dump({"forecast_errors": errors, "calibration": calibration}, f, indent=2)
 
     # -------------------------------------------------------------------------
+    # Uncertainty recalibration (weekly)
+    # -------------------------------------------------------------------------
+
+    async def _uncertainty_recalibration_job(self):
+        """
+        Runs the rolling uncertainty recalibration and queues proposals into
+        pending_approvals.json. Does NOT apply any changes automatically.
+        """
+        logger.info("Running weekly uncertainty recalibration session...")
+        try:
+            new_recs = await asyncio.get_event_loop().run_in_executor(
+                None, run_recalibration_session
+            )
+            if new_recs and self.bot:
+                await self.bot.send_alert(
+                    f"[RECALIBRATION] {len(new_recs)} uncertainty update proposal(s) queued "
+                    f"in pending_approvals.json. Review before applying."
+                )
+            logger.info(
+                f"Uncertainty recalibration complete: {len(new_recs)} proposals queued"
+            )
+        except Exception as e:
+            logger.error(f"Uncertainty recalibration error: {e}")
+
+    # -------------------------------------------------------------------------
     # Midnight reset
     # -------------------------------------------------------------------------
 
@@ -549,13 +790,15 @@ class Orchestrator:
             if self.bot:
                 await self.bot.send_morning_briefing(context)
 
-            # Load and apply history insights
+            # Load and apply history insights (uses confidence-weighted penalties)
             insights = self.history.get_insights()
             if hasattr(self.analysis, "apply_history_insights"):
                 self.analysis.apply_history_insights(insights)
                 logger.info(
                     f"Applied history insights: win_rate_7d={insights.win_rate_7d:.0%}, "
-                    f"avoid_cities={insights.avoid_cities}"
+                    f"avoid_cities={insights.avoid_cities}, "
+                    f"raise_edge_cities={insights.raise_edge_cities}, "
+                    f"open_p0_count={insights.open_p0_count}"
                 )
         except Exception as e:
             logger.error(f"Morning briefing error: {e}")
@@ -568,8 +811,12 @@ class Orchestrator:
         """
         Backfills settlement outcomes for positions older than 2 days
         that still have UNKNOWN status.
+
+        Also backfills shadow_mode_log.json and missed_opportunities.json
+        so the validation framework and opportunity tracker have resolved outcomes.
         """
         logger.info("Running settlement backfill...")
+        settled_markets: dict = {}  # ticker -> winning side ("yes"|"no"), for shadow backfill
         try:
             history = self.history._load_history()
             cutoff = (date.today() - timedelta(days=2)).isoformat()
@@ -591,12 +838,44 @@ class Orchestrator:
                                 updated += 1
                         except Exception:
                             pass
+                    # Collect settled tickers for shadow backfill.
+                    # Only include positions with a decisive outcome (non-zero PnL).
+                    # Scratch trades (pnl==0) have an ambiguous outcome and are excluded.
+                    if pos.get("status") in ("closed", "expired"):
+                        ticker = pos.get("ticker", "")
+                        pnl = pos.get("pnl_dollars", 0.0)
+                        side = pos.get("side", "")
+                        if ticker and side and pnl != 0.0:
+                            # Winning side = the side the bot held if it won, opposite if it lost.
+                            won = pnl > 0
+                            winning_side = side if won else ("no" if side == "yes" else "yes")
+                            settled_markets[ticker] = winning_side
 
             if updated > 0:
                 self.history._save_history(history)
                 logger.info(f"Settlement backfill: updated {updated} positions")
             else:
                 logger.info("Settlement backfill: no UNKNOWN positions to update")
+
+            # Backfill shadow mode log outcomes
+            if settled_markets:
+                try:
+                    from src.analysis.validation import backfill_shadow_outcomes
+                    shadow_updated = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: backfill_shadow_outcomes(settled_markets),
+                    )
+                    if shadow_updated:
+                        logger.info(f"Settlement backfill: updated {shadow_updated} shadow log entries")
+                except Exception as e:
+                    logger.warning(f"Shadow backfill error: {e}")
+
+                # Backfill missed opportunities log
+                try:
+                    self.history.backfill_missed_opportunity_outcomes(settled_markets)
+                except Exception as e:
+                    logger.warning(f"Missed opportunity backfill error: {e}")
+
         except Exception as e:
             logger.error(f"Settlement backfill error: {e}")
 
@@ -616,35 +895,28 @@ class Orchestrator:
         Returns True if reconciled (position reduced), False if not.
         """
         try:
+            # Brief delay so Kalshi's positions endpoint reflects the fill before we query.
+            # Without this, an "executed" order may not appear settled yet (race condition).
+            await asyncio.sleep(2)
             positions = await asyncio.get_event_loop().run_in_executor(
                 None, self.kalshi.get_positions
             )
             for pos in positions:
                 if pos.get("ticker") == ticker:
                     current_count = pos.get("position", 0)
-                    # If we reduced expected_reduction contracts, position should be lower
-                    # We just check it didn't increase
-                    logger.debug(f"Reconcile {ticker}: current_position={current_count}")
-                    return True  # position found, assume reduce was processed
+                    logger.debug(f"Reconcile {ticker}: current_position={current_count}, expected_reduction={expected_reduction}")
+                    if current_count > contracts - expected_reduction:
+                        logger.warning(
+                            f"Reconcile {ticker}: position={current_count} contracts but expected "
+                            f"reduction of {expected_reduction} from {contracts} — exit may not have processed"
+                        )
+                        return False
+                    return True
 
-            # Position not found at all — may have been fully closed
+            # Position not found — fully closed, which is correct for a full exit
+            logger.debug(f"Reconcile {ticker}: position not found (fully closed)")
             return True
         except Exception as e:
             logger.error(f"Reconcile exit error for {ticker}: {e}")
             return False
 
-
-# -------------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------------
-
-def _get_season(d: date) -> str:
-    month = d.month
-    if month in (12, 1, 2):
-        return "winter"
-    elif month in (3, 4, 5):
-        return "spring"
-    elif month in (6, 7, 8):
-        return "summer"
-    else:
-        return "fall"

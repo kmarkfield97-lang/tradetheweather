@@ -9,9 +9,11 @@ import json
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from src.kalshi.client import KalshiClient
 from src.weather.pipeline import WeatherPipeline
@@ -57,6 +59,56 @@ DEFAULT_UNCERTAINTY_F = 7.0
 # ── Monte Carlo settings ───────────────────────────────────────────────────────
 MC_PATHS = 2000             # number of simulated temperature paths
 
+# ── City timezone map (IANA) ───────────────────────────────────────────────────
+CITY_TIMEZONES: dict = {
+    "NYC": "America/New_York",
+    "PHILADELPHIA": "America/New_York",
+    "BOSTON": "America/New_York",
+    "DC": "America/New_York",
+    "MIAMI": "America/New_York",
+    "ATLANTA": "America/New_York",
+    "CLEVELAND": "America/New_York",
+    "NASHVILLE": "America/Chicago",
+    "CHICAGO": "America/Chicago",
+    "HOUSTON": "America/Chicago",
+    "DALLAS": "America/Chicago",
+    "SAN_ANTONIO": "America/Chicago",
+    "AUSTIN": "America/Chicago",
+    "OKLAHOMA_CITY": "America/Chicago",
+    "NEW_ORLEANS": "America/Chicago",
+    "KANSAS_CITY": "America/Chicago",
+    "MINNEAPOLIS": "America/Chicago",
+    "DENVER": "America/Denver",
+    "PHOENIX": "America/Phoenix",   # no DST
+    "LOS_ANGELES": "America/Los_Angeles",
+    "SAN_FRANCISCO": "America/Los_Angeles",
+    "SAN_DIEGO": "America/Los_Angeles",
+    "LAS_VEGAS": "America/Los_Angeles",
+    "SEATTLE": "America/Los_Angeles",
+}
+
+# Local hour (0-23) after which temp_high is effectively decided for that city.
+# This is the approximate end of the solar heating window.
+CITY_HIGH_PEAK_HOUR: dict = {
+    "PHOENIX": 19, "LAS_VEGAS": 19, "LOS_ANGELES": 18, "SAN_DIEGO": 18,
+    "SAN_FRANCISCO": 17,  # marine influence kills afternoon heating early
+    "SEATTLE": 17,
+}
+DEFAULT_HIGH_PEAK_HOUR = 19  # 7pm local — sensible default for interior cities
+
+# Kalshi weather series prefix → city key mapping (shared with tracker/pnl.py)
+SERIES_CITY_MAP: dict = {
+    "KXHIGHTPHX": "PHOENIX", "KXHIGHTHOU": "HOUSTON", "KXHIGHTMIN": "MINNEAPOLIS",
+    "KXHIGHTDAL": "DALLAS", "KXHIGHTLV": "LAS_VEGAS", "KXHIGHTSATX": "SAN_ANTONIO",
+    "KXHIGHTBOS": "BOSTON", "KXHIGHTNOLA": "NEW_ORLEANS", "KXHIGHTSFO": "SAN_FRANCISCO",
+    "KXHIGHTSEA": "SEATTLE", "KXHIGHTDC": "DC",
+    "KXHIGHTATL": "ATLANTA", "KXHIGHTOKC": "OKLAHOMA_CITY",
+    "KXLOWTCHI": "CHICAGO", "KXLOWTDEN": "DENVER", "KXLOWTNYC": "NYC",
+    "KXLOWTPHIL": "PHILADELPHIA", "KXLOWTMIA": "MIAMI", "KXLOWTLAX": "LOS_ANGELES",
+    "KXLOWTAUS": "AUSTIN",
+    "KXRAINNYC": "NYC", "KXRAINHOU": "HOUSTON", "KXRAINCHIM": "CHICAGO",
+    "KXRAINSEA": "SEATTLE",
+}
 
 @dataclass
 class TradeRecommendation:
@@ -75,6 +127,10 @@ class TradeRecommendation:
     forecast_summary: str
     alerts: list[str] = field(default_factory=list)
     signal_notes: list[str] = field(default_factory=list)
+    model_uncertainty: float = 0.3   # from signal aggregation (used in hold_ev at exit)
+    # ── Per-signal breakdown for offline analysis / future weight optimization ──
+    signal_breakdown: list[dict] = field(default_factory=list)
+    weights_version: str = "fallback"   # version of signal_weights.json active at score time
 
 
 class TradeAnalysisEngine:
@@ -85,6 +141,38 @@ class TradeAnalysisEngine:
         self._avoid_cities: set = set()
         self._city_edge_adjustments: dict = {}
         self._load_uncertainty_cache()
+        # Lazy-init history tracker reference for missed-opportunity logging
+        self._history_tracker = None
+
+    def _get_history_tracker(self):
+        if self._history_tracker is None:
+            from src.tracker.history import DailyHistoryTracker
+            self._history_tracker = DailyHistoryTracker()
+        return self._history_tracker
+
+    def _record_missed_opportunity(
+        self,
+        ticker: str,
+        city: str,
+        market_type: str,
+        rejection_reason: str,
+        our_prob: float,
+        market_price_cents: int,
+        edge_cents: float,
+    ):
+        """Best-effort logging of rejected candidates for missed-opportunity analysis."""
+        try:
+            self._get_history_tracker().record_missed_opportunity(
+                ticker=ticker,
+                city=city,
+                market_type=market_type,
+                rejection_reason=rejection_reason,
+                our_prob=our_prob,
+                market_price_cents=market_price_cents,
+                edge_cents=edge_cents,
+            )
+        except Exception as e:
+            logger.debug(f"missed_opportunity log failed for {ticker}: {e}")
 
     def _load_uncertainty_cache(self):
         """Load per-city forecast uncertainty from data/city_uncertainty.json."""
@@ -133,22 +221,140 @@ class TradeAnalysisEngine:
         else:
             return max(1.5, base * 0.30)
 
+    def _same_day_cutoff_check(
+        self,
+        city: str,
+        market_type: str,
+        threshold: Optional[float],
+        hours_left: Optional[float],
+        report: Optional[dict],
+    ) -> tuple[bool, str]:
+        """
+        Weather-aware same-day rejection logic.
+
+        For temp_high: reject once local time is past the city's heating peak hour,
+        UNLESS current observed temp is already near or past the threshold (station edge).
+
+        For temp_low: reject only after local time > 08:00 AND warming trend is positive
+        (the low has clearly passed).
+
+        For rain/snow: no time-based cutoff — precipitation can happen any hour.
+
+        Returns (should_reject, reason).
+        """
+        now_utc = datetime.now(timezone.utc)
+
+        if market_type in ("rain", "snow"):
+            # Precipitation markets: never reject on time alone (timing is the edge)
+            return False, ""
+
+        tz_name = CITY_TIMEZONES.get(city)
+        if not tz_name:
+            # Unknown city timezone — fall back to conservative 18:00 UTC rule
+            if now_utc.hour >= 18:
+                return True, "unknown city tz, fallback 18:00 UTC rule"
+            return False, ""
+
+        try:
+            local_now = now_utc.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            if now_utc.hour >= 18:
+                return True, f"tz parse failed for {tz_name}, fallback 18:00 UTC"
+            return False, ""
+
+        local_hour = local_now.hour
+
+        if market_type == "temp_high":
+            peak_hour = CITY_HIGH_PEAK_HOUR.get(city, DEFAULT_HIGH_PEAK_HOUR)
+            if local_hour < peak_hour:
+                return False, ""  # still within heating window
+
+            # Past peak hour — check if current obs already crossed threshold
+            # (station latency edge: market hasn't priced the crossing yet)
+            if report and threshold is not None:
+                obs = report.get("recent_observations", [])
+                if obs:
+                    current_temp = obs[0].get("temp_f")
+                    if current_temp is not None and current_temp >= threshold - 1.0:
+                        # Close enough — valid late trade (station edge)
+                        return False, ""
+
+            return True, (
+                f"temp_high past city peak hour {peak_hour}:00 local "
+                f"(city={city} local_hour={local_hour})"
+            )
+
+        elif market_type == "temp_low":
+            # Low temp markets settle on overnight low — reject only after warming has begun
+            if local_hour < 8:
+                return False, ""  # overnight / early morning — low not yet recorded
+            # After 8am: check if trend is warming (low has passed)
+            if report:
+                temp_trend = report.get("temp_trend")
+                obs = report.get("recent_observations", [])
+                if obs and temp_trend is not None:
+                    current_temp = obs[0].get("temp_f")
+                    if current_temp is not None and threshold is not None:
+                        if current_temp <= threshold and temp_trend > 0:
+                            # Currently at/below threshold and warming — low already hit
+                            # This is a valid station-edge observation; DON'T reject
+                            return False, ""
+                    if temp_trend > 0.5 and local_hour >= 9 and current_temp is not None and threshold is not None and current_temp <= threshold + 5.0:
+                        # Warming fast after 9am AND temp is within 5°F of threshold —
+                        # the low has likely already occurred and is now rising.
+                        # If current_temp is well above threshold, the low hasn't been
+                        # reached yet, so don't reject.
+                        return True, (
+                            f"temp_low: warming trend {temp_trend:+.2f}°F/hr after 09:00 local "
+                            f"(local_hour={local_hour}, current={current_temp}°F, threshold={threshold}°F)"
+                        )
+            # Without trend data, allow until 10:00 local
+            if local_hour >= 10:
+                return True, f"temp_low: past 10:00 local without trend confirmation (local_hour={local_hour})"
+            return False, ""
+
+        return False, ""
+
     def apply_history_insights(self, insights):
         """
         Apply historical performance insights to adjust future trade behavior.
+        Uses confidence-weighted city penalties instead of a blunt avoid-list.
         Called by orchestrator morning briefing.
         """
         if not insights:
             return
         try:
+            # Avoid-cities: only those with classifier action="avoid" AND sufficient sample
             self._avoid_cities = set(getattr(insights, "avoid_cities", []))
+
+            # Build edge-penalty map: city -> extra cents required
+            # Sources: (a) raise_edge_cities from classifier, (b) legacy win-rate check
+            self._city_edge_adjustments = {}
+
+            raise_edge = getattr(insights, "raise_edge_cities", {})
+            for city, penalty_cents in raise_edge.items():
+                self._city_edge_adjustments[city] = {
+                    "edge_penalty_cents": penalty_cents,
+                    "source": "classifier",
+                }
+
+            # Backward-compat: also check raw win-rate from performance_by_city
+            # for any city not already covered by the classifier
             perf = getattr(insights, "performance_by_city", {})
-            self._city_edge_adjustments = {
-                city: data for city, data in perf.items()
-            }
+            for city, data in perf.items():
+                if city in self._city_edge_adjustments:
+                    continue  # already covered by classifier
+                win_rate = data.get("win_rate", 0.5)
+                trade_count = data.get("trades", 0)
+                if trade_count >= 10 and win_rate < 0.40:
+                    self._city_edge_adjustments[city] = {
+                        "edge_penalty_cents": 3.0,
+                        "source": "win_rate_fallback",
+                    }
+
             logger.info(
                 f"History insights applied: avoid_cities={self._avoid_cities}, "
-                f"city_adjustments={list(self._city_edge_adjustments.keys())}"
+                f"raise_edge_cities={list(self._city_edge_adjustments.keys())}"
             )
         except Exception as e:
             logger.warning(f"apply_history_insights error: {e}")
@@ -217,14 +423,16 @@ class TradeAnalysisEngine:
             return None
         city, market_type, threshold, is_bucket = parsed
 
-        # Skip cities with bad historical performance
+        # Skip cities the classifier has marked as persistent underperformers
+        # (only after sufficient sample size — see classifier.py thresholds)
         if city in self._avoid_cities:
-            logger.debug(f"REJECTED {ticker}: {city} in avoid_cities list")
+            logger.info(f"REJECTED {ticker}: {city} in classifier avoid_cities (confidence-weighted)")
             return None
 
         # ── Time filter ────────────────────────────────────────────────────────
         close_time = market.get("close_time") or market.get("expiration_time")
         hours_left: Optional[float] = None
+        _is_same_day = False
         if close_time:
             try:
                 ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
@@ -238,10 +446,20 @@ class TradeAnalysisEngine:
                     )
                     return None
 
-                # If market settles today after noon PT (18:00 UTC) the high has occurred
-                if ct.date() == now_utc.date() and now_utc.hour >= 18:
-                    logger.debug(f"REJECTED {ticker}: same-day market after 18:00 UTC")
-                    return None
+                # Pre-report same-day check (without observation data).
+                # If it rejects, we defer final decision until after the report is fetched
+                # so station-edge exceptions (obs already past threshold) can override.
+                if ct.date() == now_utc.date():
+                    _is_same_day = True
+                    should_reject, cutoff_reason = self._same_day_cutoff_check(
+                        city, market_type, threshold, hours_left, None
+                    )
+                    if should_reject:
+                        # Don't hard-reject yet — re-check after report fetch
+                        logger.debug(
+                            f"{ticker}: pre-report same-day flag — {cutoff_reason} "
+                            f"(will re-check with observations)"
+                        )
             except Exception:
                 pass
 
@@ -293,21 +511,57 @@ class TradeAnalysisEngine:
             logger.debug(f"REJECTED {ticker}: weather data error for {city}")
             return None
 
-        # Weather data integrity: check observation freshness
+        # Weather data integrity: check observation and forecast freshness
+        now_utc = datetime.now(timezone.utc)
+        stale_station = False
         obs = report.get("recent_observations", [])
         if obs:
             latest_obs_time = obs[0].get("timestamp")
             if latest_obs_time:
                 try:
                     obs_dt = datetime.fromisoformat(latest_obs_time.replace("Z", "+00:00"))
-                    obs_age_h = (datetime.now(timezone.utc) - obs_dt).total_seconds() / 3600
-                    if obs_age_h > 6:
-                        logger.warning(
-                            f"{ticker}: weather data is {obs_age_h:.1f}h old — reducing confidence"
+                    obs_age_h = (now_utc - obs_dt).total_seconds() / 3600
+                    if obs_age_h > 4.0 and (hours_left is None or hours_left > 2.0):
+                        # Stale METAR outside final window — reject new entries
+                        logger.debug(
+                            f"REJECTED {ticker}: station observation is {obs_age_h:.1f}h old "
+                            f"(limit 4h outside final 2h window)"
                         )
-                        # Don't reject, but the metar_latency signal will penalise
+                        return None
+                    elif obs_age_h > 1.0:
+                        stale_station = True
+                        logger.debug(
+                            f"{ticker}: station observation is {obs_age_h:.1f}h old — "
+                            f"metar signals penalized"
+                        )
                 except Exception:
                     pass
+
+        # Forecast freshness: reject if NWS forecast is older than 4h (outside final 2h)
+        forecast_generated_at = report.get("forecast", {}).get("generated_at")
+        if forecast_generated_at and (hours_left is None or hours_left > 2.0):
+            try:
+                fc_dt = datetime.fromisoformat(forecast_generated_at.replace("Z", "+00:00"))
+                fc_age_h = (now_utc - fc_dt).total_seconds() / 3600
+                if fc_age_h > 4.0:
+                    logger.debug(
+                        f"REJECTED {ticker}: NWS forecast is {fc_age_h:.1f}h old "
+                        f"(limit 4h outside final 2h window)"
+                    )
+                    return None
+            except Exception:
+                pass
+
+        # ── Post-report same-day cutoff (with observation data) ───────────────
+        # Now we have fresh obs — re-run the same-day check so station-edge
+        # exceptions (observed temp already near/past threshold) can override.
+        if _is_same_day:
+            should_reject, cutoff_reason = self._same_day_cutoff_check(
+                city, market_type, threshold, hours_left, report
+            )
+            if should_reject:
+                logger.debug(f"REJECTED {ticker}: same-day cutoff (post-obs) — {cutoff_reason}")
+                return None
 
         # ── Score the market ───────────────────────────────────────────────────
         sigma = self._get_dynamic_sigma(city, market_type, hours_left)
@@ -348,10 +602,13 @@ class TradeAnalysisEngine:
         except Exception as e:
             logger.debug(f"station_bias signal error: {e}")
 
-        # Temperature trajectory (now uses corrected temp_trend sign)
+        # Temperature trajectory (with path-to-threshold projection)
         if market_type in ("temp_high", "temp_low") and threshold is not None:
             try:
-                sig = temperature_trajectory.compute(report, threshold, market_type)
+                sig = temperature_trajectory.compute(
+                    report, threshold, market_type,
+                    hours_to_close=hours_left,
+                )
                 signal_inputs.append(sig)
             except Exception as e:
                 logger.debug(f"temp_trajectory signal error: {e}")
@@ -363,10 +620,22 @@ class TradeAnalysisEngine:
         except Exception as e:
             logger.debug(f"forecast_update signal error: {e}")
 
-        # METAR latency (current station temp vs threshold)
+        # METAR latency (with age tiers and local-hour context)
         if market_type in ("temp_high", "temp_low") and threshold is not None:
             try:
-                sig = metar_latency.compute(report, threshold, market_type)
+                # Derive local hour from city timezone for time-of-day context
+                metar_local_hour: Optional[int] = None
+                tz_name = CITY_TIMEZONES.get(city)
+                if tz_name:
+                    try:
+                        metar_local_hour = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).hour
+                    except Exception:
+                        pass
+                sig = metar_latency.compute(
+                    report, threshold, market_type,
+                    stale_station=stale_station,
+                    local_hour=metar_local_hour,
+                )
                 signal_inputs.append(sig)
             except Exception as e:
                 logger.debug(f"metar_latency signal error: {e}")
@@ -378,10 +647,14 @@ class TradeAnalysisEngine:
         except Exception as e:
             logger.debug(f"orderbook signal error: {e}")
 
-        # Market implied probability (extreme disagreement guard)
+        # Market implied probability (extreme disagreement guard + diagnosis)
         extreme_disagreement = False
         try:
-            mip_sig = market_implied_prob.compute(liquidity, base_prob, side)
+            mip_sig = market_implied_prob.compute(
+                liquidity, base_prob, side,
+                forecast_report=report.get("forecast"),
+                hours_left=hours_left,
+            )
             signal_inputs.append(mip_sig)
             # Flag if extreme disagreement — will require wider edge
             if mip_sig.get("confidence", 1.0) <= 0.2:
@@ -398,11 +671,29 @@ class TradeAnalysisEngine:
         except Exception as e:
             logger.debug(f"threshold_clustering signal error: {e}")
 
+        # Build structured signal breakdown for offline analysis
+        # (stored on the recommendation and in shadow_mode_log.json)
+        signal_breakdown = [
+            {
+                "name":             s.get("note", f"signal_{i}"),
+                "prob_adjustment":  round(s.get("prob_adjustment", 0.0), 4),
+                "confidence":       round(s.get("confidence", 0.5), 3),
+                "note":             s.get("note", ""),
+            }
+            for i, s in enumerate(signal_inputs)
+        ]
+
         # Aggregate all signals
         agg = signal_aggregator.aggregate(signal_inputs)
 
-        # Apply capped probability adjustment
-        adj = max(-0.20, min(0.20, agg.prob_adjustment))
+        # Apply contextual probability adjustment cap (regime-aware, not flat ±20¢)
+        adj_cap = self._compute_adj_cap(market_type, hours_left, agg, report, threshold)
+        adj = max(-adj_cap, min(adj_cap, agg.prob_adjustment))
+        logger.debug(
+            f"{ticker}: signal_cap={adj_cap:.2f} raw_adj={agg.prob_adjustment:+.4f} "
+            f"clamped_adj={adj:+.4f} agreement={agg.signal_agreement:.0%} "
+            f"active={agg.active_signals}"
+        )
         our_prob = max(0.01, min(0.99, base_prob + adj))
 
         # Recompute edge with adjusted probability
@@ -424,20 +715,48 @@ class TradeAnalysisEngine:
         if extreme_disagreement:
             min_edge_req = max(min_edge_req, EXTREME_DISAGREEMENT_EDGE)
 
-        # Historical performance edge adjustment
-        city_perf = self._city_edge_adjustments.get(city)
-        if city_perf:
-            win_rate = city_perf.get("win_rate", 0.5)
-            trade_count = city_perf.get("trades", 0)
-            if trade_count >= 10 and win_rate < 0.40:
-                # Bad track record — require more edge
-                min_edge_req = max(min_edge_req, 0.10)
+        # Historical performance edge adjustment (confidence-weighted, from classifier)
+        city_adj = self._city_edge_adjustments.get(city)
+        if city_adj:
+            penalty_cents = city_adj.get("edge_penalty_cents", 0.0)
+            if penalty_cents > 0:
+                min_edge_req = max(min_edge_req, min_edge_req + penalty_cents / 100.0)
+                logger.debug(
+                    f"{ticker}: city={city} edge penalty +{penalty_cents:.0f}¢ "
+                    f"(source={city_adj.get('source', '?')}) → min_edge={min_edge_req:.3f}"
+                )
 
         if edge < min_edge_req:
-            logger.debug(
-                f"REJECTED {ticker}: edge={edge:.3f} < min_edge={min_edge_req:.3f} "
-                f"(vol={total_volume}, extreme_disagree={extreme_disagreement})"
+            gap = min_edge_req - edge
+            rejection_reason = (
+                f"edge={edge:.3f}_below_min={min_edge_req:.3f}"
+                if not extreme_disagreement
+                else f"extreme_disagreement_edge={edge:.3f}_below_min={min_edge_req:.3f}"
             )
+            if gap <= 0.03:
+                # Close miss — log at INFO and record as missed opportunity candidate
+                logger.info(
+                    f"CLOSE_REJECT {ticker}: edge={edge:.3f} just below min={min_edge_req:.3f} "
+                    f"(gap={gap:.3f}) city={city} type={market_type} "
+                    f"extreme_disagree={extreme_disagreement}"
+                )
+                self._record_missed_opportunity(
+                    ticker=ticker, city=city, market_type=market_type,
+                    rejection_reason=f"close_miss_{rejection_reason}",
+                    our_prob=our_prob, market_price_cents=price, edge_cents=edge * 100,
+                )
+            else:
+                logger.debug(
+                    f"REJECTED {ticker}: edge={edge:.3f} < min_edge={min_edge_req:.3f} "
+                    f"(vol={total_volume}, extreme_disagree={extreme_disagreement})"
+                )
+                # Only record missed opportunity if edge was actually meaningful (>3¢)
+                if edge >= 0.03:
+                    self._record_missed_opportunity(
+                        ticker=ticker, city=city, market_type=market_type,
+                        rejection_reason=rejection_reason,
+                        our_prob=our_prob, market_price_cents=price, edge_cents=edge * 100,
+                    )
             return None
 
         # ── Price floor ────────────────────────────────────────────────────────
@@ -468,16 +787,19 @@ class TradeAnalysisEngine:
         except Exception as e:
             logger.warning(f"position_sizer error for {ticker}: {e}")
             # Fallback: inline 1/4 Kelly
+            if price <= 0:
+                return None
             prob_win = our_prob if side == "yes" else (1 - our_prob)
             prob_lose = 1 - prob_win
             odds = (100 - price) / price
             kelly = max(0, (prob_win * odds - prob_lose) / odds)
-            position_dollars = max(0.50, min(daily_budget * kelly * 0.25, MAX_DOLLARS_PER_TRADE))
+            position_dollars = min(daily_budget * kelly * 0.25, MAX_DOLLARS_PER_TRADE)
 
-        # Apply absolute caps
+        # Apply absolute caps; use relative minimum (1% of budget, floor $0.10) not fixed $0.50
         max_position = min(daily_budget * MAX_POSITION_PCT, MAX_DOLLARS_PER_TRADE)
+        min_position = max(0.10, daily_budget * 0.01)
         position_dollars = min(position_dollars, max_position)
-        position_dollars = max(0.50, round(position_dollars, 2))
+        position_dollars = max(min_position, round(position_dollars, 2))
 
         contracts = math.floor(position_dollars / (price / 100))
         if contracts < 1:
@@ -529,8 +851,36 @@ class TradeAnalysisEngine:
             f"sigma={sigma:.1f}°F active_signals={agg.active_signals} "
             f"agreement={agg.signal_agreement:.0%} | "
             f"contracts={contracts} cost=${actual_cost:.2f} confidence={confidence} | "
-            f"signals={signal_notes}"
+            f"weights_ver={agg.weights_version} signals={signal_notes}"
         )
+
+        # ── Shadow-mode evaluation log ─────────────────────────────────────────
+        # Always log every scored recommendation (executed or not) so the
+        # validation framework can compare candidate configs offline.
+        try:
+            from src.analysis.validation import log_shadow_evaluation
+            log_shadow_evaluation(
+                ticker=ticker,
+                city=city,
+                market_type=market_type,
+                our_prob=our_prob,
+                market_price_cents=price,
+                edge_cents=round(edge * 100, 2),
+                signal_breakdown=signal_breakdown,
+                weights_version=agg.weights_version,
+                context={
+                    "hours_left":          hours_left,
+                    "base_prob":           round(base_prob, 4),
+                    "signal_adj":          round(adj, 4),
+                    "cap_regime":          agg.cap_regime,
+                    "signal_agreement":    round(agg.signal_agreement, 3),
+                    "model_uncertainty":   round(agg.model_uncertainty, 3),
+                    "sigma_f":             round(sigma, 2),
+                    "extreme_disagreement": extreme_disagreement,
+                },
+            )
+        except Exception as _shadow_err:
+            logger.debug(f"shadow_log failed for {ticker}: {_shadow_err}")
 
         return TradeRecommendation(
             ticker=ticker,
@@ -548,7 +898,52 @@ class TradeAnalysisEngine:
             forecast_summary=forecast_summary,
             alerts=alerts,
             signal_notes=signal_notes,
+            model_uncertainty=round(agg.model_uncertainty, 3),
+            signal_breakdown=signal_breakdown,
+            weights_version=agg.weights_version,
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Contextual signal adjustment cap
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_adj_cap(
+        market_type: str,
+        hours_left: Optional[float],
+        agg,
+        report: dict,
+        threshold: Optional[float],
+    ) -> float:
+        """
+        Returns the appropriate ±cap for signal probability adjustment.
+
+        Regimes:
+          noisy:            signal agreement < 0.6 AND < 3 active signals  → ±0.08
+          normal (default):                                                 → ±0.12
+          high-confidence:  agreement >= 0.8, active >= 3, hours_left < 6  → ±0.18
+          final-threshold:  hours_left < 1, obs temp within 1°F of thresh  → ±0.22
+        """
+        active = agg.active_signals
+        agreement = agg.signal_agreement
+
+        # Noisy regime — few, conflicting signals
+        if agreement < 0.6 and active < 3:
+            return 0.08
+
+        # Final-hour threshold-crossing regime
+        if hours_left is not None and hours_left < 1.0 and threshold is not None:
+            obs = report.get("recent_observations", [])
+            if obs:
+                cur = obs[0].get("temp_f")
+                if cur is not None and abs(cur - threshold) <= 1.5:
+                    return 0.22
+
+        # High-confidence live-data regime
+        if agreement >= 0.8 and active >= 3 and hours_left is not None and hours_left < 6.0:
+            return 0.18
+
+        return 0.12
 
     # ─────────────────────────────────────────────────────────────────────────
     # Executable liquidity helper
@@ -573,31 +968,17 @@ class TradeAnalysisEngine:
     # Market parser
     # ─────────────────────────────────────────────────────────────────────────
 
-    SERIES_CITY_MAP = {
-        "KXHIGHTPHX": "PHOENIX", "KXHIGHTHOU": "HOUSTON", "KXHIGHTMIN": "MINNEAPOLIS",
-        "KXHIGHTDAL": "DALLAS", "KXHIGHTLV": "LAS_VEGAS", "KXHIGHTSATX": "SAN_ANTONIO",
-        "KXHIGHTBOS": "BOSTON", "KXHIGHTNOLA": "NEW_ORLEANS", "KXHIGHTSFO": "SAN_FRANCISCO",
-        "KXHIGHTSEA": "SEATTLE", "KXHIGHTDC": "DC",
-        "KXHIGHTATL": "ATLANTA", "KXHIGHTOKC": "OKLAHOMA_CITY",
-        "KXLOWTCHI": "CHICAGO", "KXLOWTDEN": "DENVER", "KXLOWTNYC": "NYC",
-        "KXLOWTPHIL": "PHILADELPHIA", "KXLOWTMIA": "MIAMI", "KXLOWTLAX": "LOS_ANGELES",
-        "KXLOWTAUS": "AUSTIN",
-        "KXRAINNYC": "NYC", "KXRAINHOU": "HOUSTON", "KXRAINCHIM": "CHICAGO",
-        "KXRAINSEA": "SEATTLE",
-    }
-
     def _parse_market(self, ticker: str, title: str) -> Optional[tuple]:
         """
         Attempts to extract (city, market_type, threshold, is_bucket) from ticker/title.
         Returns None if we can't parse it confidently.
         Threshold is returned as float to preserve precision (e.g. 67.5°F).
         """
-        import re
         ticker_upper = ticker.upper()
         title_lower = title.lower()
 
         city = None
-        for prefix, mapped_city in self.SERIES_CITY_MAP.items():
+        for prefix, mapped_city in SERIES_CITY_MAP.items():
             if ticker_upper.startswith(prefix):
                 city = mapped_city
                 break
@@ -629,7 +1010,7 @@ class TradeAnalysisEngine:
             return None
 
         market_type = None
-        series_prefix = next((p for p in self.SERIES_CITY_MAP if ticker_upper.startswith(p)), "")
+        series_prefix = next((p for p in SERIES_CITY_MAP if ticker_upper.startswith(p)), "")
         if "HIGH" in series_prefix or "HIGHT" in series_prefix:
             market_type = "temp_high"
         elif "LOW" in series_prefix or "LOWT" in series_prefix:
@@ -680,13 +1061,12 @@ class TradeAnalysisEngine:
         city: str = "",
         is_bucket: bool = False,
         sigma: float = DEFAULT_UNCERTAINTY_F,
-        hours_to_close: Optional[float] = None,  # reserved for future time-decay logic
+        hours_to_close: Optional[float] = None,
     ) -> Optional[tuple[float, str, str]]:
         """
         Returns (probability, reasoning, forecast_summary) or None if market type unsupported.
         probability is our estimated P(YES) for the market.
         """
-        _ = hours_to_close  # accepted for future use; sigma already incorporates time
         forecast = report.get("forecast", {})
         hourly = report.get("hourly", [])
         moon = report.get("moon", {})
@@ -739,11 +1119,14 @@ class TradeAnalysisEngine:
             corrected_low = low_temp + trend_adj
 
             if is_bucket:
+                # Bucket: P(threshold <= low <= threshold+2) = P(low <= threshold+2) - P(low <= threshold)
+                # = (1 - P(low > threshold+2)) - (1 - P(low > threshold)) = P(low > threshold) - P(low > threshold+2)
                 p_above_lo = self._sigmoid((corrected_low - threshold) / sigma)
                 p_above_hi = self._sigmoid((corrected_low - (threshold + 2.0)) / sigma)
                 prob = p_above_lo - p_above_hi
             else:
-                prob = self._monte_carlo_prob(corrected_low, threshold, sigma, "above")
+                # temp_low YES wins when low_temp <= threshold, so P(YES) = P(X <= threshold) = "below"
+                prob = self._monte_carlo_prob(corrected_low, threshold, sigma, "below")
 
             trend_str = f"{temp_trend:+.3f}" if temp_trend is not None else "N/A"
             reasoning = (
@@ -756,7 +1139,9 @@ class TradeAnalysisEngine:
             return prob, reasoning, forecast_summary
 
         elif market_type == "rain":
-            prob, reasoning = self._score_rain(precip_chance, hourly, moon, alerts, short_fc)
+            prob, reasoning = self._score_rain(
+                precip_chance, hourly, moon, alerts, short_fc, hours_to_close
+            )
             return prob, reasoning, forecast_summary
 
         elif market_type == "snow":
@@ -774,51 +1159,127 @@ class TradeAnalysisEngine:
         moon: dict,
         alerts: list,
         short_fc: str,
+        hours_left: Optional[float] = None,
     ) -> tuple[float, str]:
         """
-        Improved rain probability using hourly independence model.
-        P(any rain) = 1 - product(1 - P_hour_i) across settlement window hours.
+        Rain probability using a clustered hourly model (reduces naive independence bias).
+
+        Model:
+          - Identify storm clusters: consecutive hours with precip_chance >= 20%.
+          - Treat each cluster as a single correlated event with P = max(cluster) * 0.85.
+          - Independent hours outside clusters multiply as (1 - p_i).
+          - Only include hourly slots within the settlement window (hours_left).
+          - Storm-system persistence bonus if weather text suggests organized event.
+          - Wet-bulb ambiguity penalty if low_temp near freezing.
         """
         moon_phase = moon.get("phase_name", "")
 
-        # Hourly independence model: P(any rain in window) = 1 - prod(1 - p_i)
-        if hourly:
-            hourly_probs = [
-                h.get("precip_chance", 0) / 100.0
-                for h in hourly[:12]  # next 12 hours
-                if h.get("precip_chance") is not None
-            ]
-            if hourly_probs:
-                no_rain_product = 1.0
-                for p in hourly_probs:
-                    no_rain_product *= (1 - p)
-                hourly_any_rain = 1.0 - no_rain_product
-                # Blend: 60% hourly model, 40% point-in-time NWS forecast
-                base_prob = 0.60 * hourly_any_rain + 0.40 * (precip_chance / 100.0)
-            else:
-                base_prob = precip_chance / 100.0
-        else:
-            base_prob = precip_chance / 100.0
+        # Filter hourly data to settlement window
+        max_hours = min(12, int(hours_left) + 1) if hours_left is not None else 12
+        relevant_hourly = [h for h in hourly[:max_hours] if h.get("precip_chance") is not None]
 
-        # Active rain/flood alerts
         has_rain_alert = any(
             "rain" in a["event"].lower() or "flood" in a["event"].lower()
             for a in alerts
         )
+
+        if relevant_hourly:
+            # Identify clusters of consecutive rainy hours (precip_chance >= 20%)
+            in_cluster = False
+            cluster_probs: list[float] = []
+            isolated_no_rains: list[float] = []
+            cluster_contributions: list[float] = []
+
+            i = 0
+            while i < len(relevant_hourly):
+                p = relevant_hourly[i].get("precip_chance", 0) / 100.0
+                if p >= 0.20:
+                    # Start or continue a cluster
+                    cluster_probs.append(p)
+                    in_cluster = True
+                    # Look ahead to collect consecutive rainy hours
+                    j = i + 1
+                    while j < len(relevant_hourly):
+                        p_next = relevant_hourly[j].get("precip_chance", 0) / 100.0
+                        if p_next >= 0.20:
+                            cluster_probs.append(p_next)
+                            j += 1
+                        else:
+                            break
+                    # Cluster event probability: max of cluster * 0.85 (correlated, not independent)
+                    cluster_p_event = min(0.97, max(cluster_probs) * 0.85)
+                    cluster_contributions.append(cluster_p_event)
+                    cluster_probs = []
+                    i = j
+                else:
+                    # Isolated dry or low-chance hour
+                    isolated_no_rains.append(1 - p)
+                    i += 1
+
+            # P(no rain from isolated hours) = product of isolated no-rains
+            no_rain_isolated = 1.0
+            for nr in isolated_no_rains:
+                no_rain_isolated *= nr
+
+            # P(no rain from any cluster) = product of (1 - cluster_p_event)
+            no_rain_clusters = 1.0
+            for cp in cluster_contributions:
+                no_rain_clusters *= (1 - cp)
+
+            hourly_any_rain = 1.0 - (no_rain_isolated * no_rain_clusters)
+
+            # Blend: 60% clustered hourly model, 40% NWS point forecast
+            base_prob = 0.60 * hourly_any_rain + 0.40 * (precip_chance / 100.0)
+        else:
+            base_prob = precip_chance / 100.0
+
+        # Storm persistence bonus: organized weather systems are more reliable
+        storm_keywords = ["storm", "system", "front", "low pressure", "squall", "line"]
+        has_storm_system = any(kw in short_fc.lower() for kw in storm_keywords)
+        if has_storm_system:
+            base_prob = min(0.95, base_prob + 0.05)
+
+        # Active rain/flood alerts
         if has_rain_alert:
             base_prob = min(1.0, base_prob + 0.10)
 
         prob = min(1.0, max(0.01, base_prob))
 
-        # Moon phase note only (removed probability modifier — no empirical backing)
         reasoning = (
             f"NWS precipitation probability: {precip_chance}%. "
-            f"Hourly independence model: {prob:.0%}. "
+            f"Clustered hourly model (window={max_hours}h): {prob:.0%}. "
             f"Moon phase: {moon_phase}. "
+            f"{'Storm system detected. ' if has_storm_system else ''}"
             f"{'Active rain/flood alerts. ' if has_rain_alert else ''}"
             f"Forecast: {short_fc}."
         )
         return prob, reasoning
+
+    @staticmethod
+    def _estimate_wet_bulb(temp_f: float, dewpoint_f: Optional[float]) -> Optional[float]:
+        """
+        Estimates wet-bulb temperature (°F) using Stull formula approximation.
+        Returns None if dewpoint is unavailable.
+        Only meaningful in the 30–45°F range for mixed-precip detection.
+        """
+        if dewpoint_f is None:
+            return None
+        # Convert to Celsius for Stull formula
+        t_c = (temp_f - 32) * 5 / 9
+        rh = 100 * math.exp(
+            (17.625 * (dewpoint_f - 32) * 5 / 9) / (243.04 + (dewpoint_f - 32) * 5 / 9)
+            - (17.625 * t_c) / (243.04 + t_c)
+        )
+        rh = max(1.0, min(100.0, rh))
+        # Stull wet-bulb approx (°C)
+        wb_c = (
+            t_c * math.atan(0.151977 * (rh + 8.313659) ** 0.5)
+            + math.atan(t_c + rh)
+            - math.atan(rh - 1.676331)
+            + 0.00391838 * rh ** 1.5 * math.atan(0.023101 * rh)
+            - 4.686035
+        )
+        return wb_c * 9 / 5 + 32
 
     def _score_snow(
         self,
@@ -827,49 +1288,89 @@ class TradeAnalysisEngine:
         detailed_fc: str,
         alerts: list,
         moon: dict,
-        low_temp: Optional[float],  # reserved for future below-freezing guard
+        low_temp: Optional[float],
     ) -> tuple[float, str]:
         """
-        Improved snow probability using hourly sub-freezing + precip check.
+        Conservative snow probability using:
+          - sub-freezing + wet-bulb checks per hourly slot
+          - mixed-precip penalty for marginal temperatures
+          - multi-condition alignment gate (>40% requires ≥2 strong conditions)
+          - lower fallback prior (3%)
         """
-        _ = low_temp  # used indirectly via hourly temps; kept for API consistency
         snow_keywords = ["snow", "flurr", "blizzard", "winter storm", "sleet", "freezing"]
+        accumulation_keywords = ["accumulation", "inches", "accumulating", "heavy snow"]
         has_snow_fc = any(kw in detailed_fc.lower() for kw in snow_keywords)
+        has_accumulation_fc = any(kw in detailed_fc.lower() for kw in accumulation_keywords)
         snow_alert = any(
             "snow" in a["event"].lower() or "winter" in a["event"].lower()
             for a in alerts
         )
 
-        # Count hours with both precipitation chance and sub-freezing temps
+        # Count qualifying snow hours and detect mixed-precip risk
         snow_hours = 0
+        mixed_precip_hours = 0
+        very_cold_hours = 0  # temp < 30°F
         total_hours_checked = 0
+
         for h in hourly[:12]:
             temp = h.get("temp_f")
             precip = h.get("precip_chance", 0) or 0
+            dewpoint = h.get("dewpoint_f")
             fc_text = (h.get("short_forecast") or "").lower()
             total_hours_checked += 1
-            if temp is not None and temp <= 34 and precip >= 20:
-                snow_hours += 1
-            elif any(kw in fc_text for kw in snow_keywords) and precip >= 10:
-                snow_hours += 1
 
+            if temp is not None:
+                if temp < 30 and precip >= 20:
+                    snow_hours += 1
+                    very_cold_hours += 1
+                elif temp <= 34 and precip >= 20:
+                    # Check wet-bulb for mixed-precip risk
+                    wb = self._estimate_wet_bulb(temp, dewpoint)
+                    if wb is not None and wb > 34.0:
+                        # Wet-bulb above 34°F → likely rain or sleet, not accumulating snow
+                        mixed_precip_hours += 1
+                    else:
+                        snow_hours += 1
+                elif any(kw in fc_text for kw in snow_keywords) and precip >= 10:
+                    snow_hours += 1
+
+        # Base probability
         if snow_hours > 0 and total_hours_checked > 0:
             snow_hour_fraction = snow_hours / total_hours_checked
             base_prob = (precip_chance / 100.0) * snow_hour_fraction
         elif has_snow_fc:
             base_prob = precip_chance / 100.0 * 0.5
         else:
-            base_prob = 0.05
+            base_prob = 0.03  # conservative prior — snow is rare
 
+        # Mixed-precip penalty: marginal temps reduce snow confidence
+        if mixed_precip_hours > 0 and snow_hours > 0:
+            mixed_frac = mixed_precip_hours / (mixed_precip_hours + snow_hours)
+            base_prob *= (1.0 - 0.40 * mixed_frac)  # up to -40% for all-mixed
+
+        # Snow alert bonus
         if snow_alert:
             base_prob = min(1.0, base_prob + 0.15)
+
+        # Multi-condition alignment gate: cap at 0.40 without ≥2 strong conditions
+        strong_conditions = sum([
+            snow_hours >= 3,
+            snow_alert,
+            has_accumulation_fc,
+            very_cold_hours >= 3,
+        ])
+        if strong_conditions < 2:
+            base_prob = min(0.40, base_prob)
 
         prob = min(1.0, max(0.01, base_prob))
 
         reasoning = (
             f"Snow keywords in forecast: {'yes' if has_snow_fc else 'no'}. "
+            f"Accumulation language: {'yes' if has_accumulation_fc else 'no'}. "
             f"Precip chance: {precip_chance}%. "
-            f"Sub-freezing precip hours: {snow_hours}/{total_hours_checked}. "
+            f"Snow-qualifying hours: {snow_hours}/{total_hours_checked} "
+            f"(very cold: {very_cold_hours}, mixed-precip risk: {mixed_precip_hours}). "
+            f"Strong conditions met: {strong_conditions}/4. "
             f"Winter weather alerts: {'yes' if snow_alert else 'no'}. "
             f"Moon: {moon.get('phase_name', 'unknown')}."
         )
