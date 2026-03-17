@@ -184,6 +184,49 @@ class Orchestrator:
     # Balance refresh + fill check
     # -------------------------------------------------------------------------
 
+    def _update_pending_buy_capital(self, resting_orders: list):
+        """
+        Compute capital reserved by resting BUY orders (not exit orders placed by
+        this bot) and write it into tracker.state.pending_buy_dollars.
+
+        Kalshi order fields used:
+          - action: "buy" | "sell"
+          - side: "yes" | "no"
+          - yes_price: limit price in cents for the YES side
+          - remaining_count: unfilled contracts still resting
+
+        Capital reserved = sum over resting buy orders of:
+            (price_cents / 100) * remaining_count
+        where price_cents is the price the buyer is paying (yes_price for YES buys,
+        (100 - yes_price) for NO buys).
+
+        Exit orders (those in _bot_exit_order_ids or _pending_exits) are excluded —
+        they represent sells, not new capital deployment.
+        """
+        exit_ids = self._bot_exit_order_ids | set(self._pending_exits.keys())
+        total_pending = 0.0
+        for o in resting_orders:
+            oid = o.get("order_id", "")
+            if oid in exit_ids:
+                continue
+            action = o.get("action", "")
+            if action != "buy":
+                continue
+            yes_price = o.get("yes_price", 0) or 0
+            side = o.get("side", "yes")
+            price_cents = yes_price if side == "yes" else (100 - yes_price)
+            remaining = o.get("remaining_count", 0) or 0
+            total_pending += (price_cents / 100.0) * remaining
+
+        prev = self.tracker.state.pending_buy_dollars
+        self.tracker.state.pending_buy_dollars = total_pending
+        if abs(total_pending - prev) >= 0.01:
+            logger.info(
+                f"PENDING_BUY_CAPITAL updated: ${total_pending:.2f} "
+                f"(was ${prev:.2f}, delta ${total_pending - prev:+.2f}) "
+                f"from {len(resting_orders)} resting orders"
+            )
+
     async def _balance_refresh_job(self):
         """Refresh balance, check fills, and enforce profit targets."""
         try:
@@ -199,6 +242,23 @@ class Orchestrator:
                     await self.bot.send_alert(
                         f"TRADING HALTED\n{self.tracker.format_summary()}"
                     )
+
+            # Check for stalled / capital-trap positions and alert if found
+            try:
+                stalled = self.tracker.classify_stalled_positions()
+                for report in stalled:
+                    if self.bot and report["action"] in ("escalate_fair_value_exit", "attempt_partial_reduction"):
+                        await self.bot.send_alert(
+                            f"CAPITAL TRAP [{report['action'].upper()}] "
+                            f"{report['ticker']} {report['side'].upper()} | "
+                            f"age={report['age_minutes']:.0f}min "
+                            f"mark={report['mark_cents']}¢ state={report['state']} | "
+                            f"hold_ev={report['hold_ev']:.1f}¢ exit_ev={report['exit_ev']:.1f}¢ "
+                            f"exitability={report['exitability_score']}/100 | "
+                            f"flags={report['stall_flags']}"
+                        )
+            except Exception as e:
+                logger.error(f"Stalled position check error: {e}")
 
             # Check per-position exits (profit takes, trailing stops, thesis invalidation)
             profit_takes = self.tracker.check_profit_takes()
@@ -268,6 +328,7 @@ class Orchestrator:
         Compare current resting orders against known set.
         Notify on fills (orders that disappeared from resting list).
         Resolves pending exit orders when they fill.
+        Also updates pending_buy_dollars in tracker state for capital accounting.
         """
         try:
             current_resting = self.kalshi.get_orders(status="resting")
@@ -306,6 +367,10 @@ class Orchestrator:
                         await self.bot.send_alert(msg)
 
             self._known_resting_ids = current_ids
+
+            # Update pending buy capital for accurate deployable-capital accounting
+            self._update_pending_buy_capital(current_resting)
+
         except Exception as e:
             logger.error(f"Check order fills error: {e}")
 

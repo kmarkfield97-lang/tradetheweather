@@ -44,6 +44,29 @@ PROFIT_TAKE_BANDS = [
     (96, 99, 0.85),   # 96–99¢: exit 85% unless source mechanics secure outcome
 ]
 
+# ─── Entry-relative trim gates ───────────────────────────────────────────────
+# A trim band fires only if the position has gained at least this much from entry.
+# Prevents aggressive de-risking on tiny gains (e.g. entered at 74¢, mark 76¢).
+#
+# Structure: (band_min_cents, min_gain_pct, min_gain_cents)
+#   band_min_cents  – lowest cent of the trim band (matches PROFIT_TAKE_BANDS)
+#   min_gain_pct    – unrealised gain % (from entry) required to allow full trim
+#   min_gain_cents  – unrealised gain in cents required to allow full trim
+#
+# Both thresholds must be met for a full trim; if only one is met the trim
+# fraction is halved.  If neither is met the trim is suppressed entirely.
+TRIM_ENTRY_GATES = [
+    (70, 0.10, 5),   # 70–79¢ band: need ≥10% gain AND ≥5¢ above entry
+    (80, 0.15, 8),   # 80–89¢ band: need ≥15% gain AND ≥8¢ above entry
+    (90, 0.20, 10),  # 90–95¢ band: need ≥20% gain AND ≥10¢ above entry
+    (96, 0.25, 12),  # 96–99¢ band: need ≥25% gain AND ≥12¢ above entry
+]
+
+# Minimum net exit value (after slippage) that must exceed entry price for a
+# trim to lock in any real profit at all.  Trims that would merely return
+# capital at cost are suppressed.
+TRIM_MIN_NET_PROFIT_CENTS = 1       # exit_net must beat entry by at least 1¢
+
 # ─── Progressive trailing stop bands ─────────────────────────────────────────
 # Arms after peak > entry + 25%. Tightens as peak rises.
 # Each entry: (peak_min_cents, peak_max_cents, giveback_fraction)
@@ -85,6 +108,16 @@ STATE_LOCKED = "locked"
 STATE_NEAR_LOCKED = "near_locked"
 STATE_LIVE = "live"
 STATE_BROKEN = "broken"
+STATE_STALLED = "stalled"          # capital trap: poor EV, poor liquidity, no catalyst
+
+# ─── Capital trap / stalled position thresholds ───────────────────────────────
+STALL_MIN_AGE_MINUTES = 45          # position must be at least this old to be flagged
+STALL_HOLD_EV_CEILING = 45.0        # hold EV below this (¢) raises concern
+STALL_EXIT_EV_CEILING = 40.0        # exit EV below this (¢) raises concern
+STALL_SPREAD_WIDE_CENTS = 10        # spread at or above this is "wide"
+STALL_POOR_LIQUIDITY_DOLLARS = 2.0  # total book depth below this is "poor"
+STALL_MFE_REQUIRED_CENTS = 3        # if HWM never exceeded entry+this, no favorable excursion
+STALL_SCORE_THRESHOLD = 3           # flags needed (out of 6) to be classified stalled
 
 # ─── Exit reason constants ────────────────────────────────────────────────────
 # Use these constants everywhere an exit reason is recorded so the classifier
@@ -173,13 +206,74 @@ def _trailing_stop_floor(peak: int) -> Optional[int]:
 
 def _staged_trim_fraction(mark: int, is_locked: bool) -> float:
     """
-    Returns the fraction of contracts to trim at the current mark price.
+    Returns the base trim fraction for the current mark price band.
     0 means hold, 1.0 means exit all.
+    Does NOT apply entry-relative gates — callers use _entry_relative_trim_fraction.
     """
     for band_min, band_max, fraction in PROFIT_TAKE_BANDS:
         if band_min <= mark <= band_max:
             return 0.0 if is_locked else fraction
     return 0.0
+
+
+def _entry_gate_for_band(mark: int) -> Optional[tuple]:
+    """Returns (min_gain_pct, min_gain_cents) for the band containing mark, or None."""
+    # Resolve which PROFIT_TAKE_BAND mark falls in, then look up its gate.
+    for pb_min, pb_max, _ in PROFIT_TAKE_BANDS:
+        if pb_min <= mark <= pb_max:
+            for gate_band_min, min_pct, min_cents in TRIM_ENTRY_GATES:
+                if gate_band_min == pb_min:
+                    return (min_pct, min_cents)
+            return None  # band exists but no gate defined
+    return None  # mark not in any band
+
+
+def _entry_relative_trim_fraction(
+    mark: int,
+    entry_price: int,
+    is_locked: bool,
+) -> tuple[float, str]:
+    """
+    Returns (adjusted_trim_fraction, gate_reason) using both the current mark
+    band and entry-relative profitability gates.
+
+    Gate logic:
+      - Both min_gain_pct AND min_gain_cents must be met → full base fraction
+      - Only one met → half the base fraction (partial trim)
+      - Neither met → suppress trim (0.0)
+      - Net exit value (mark - slippage - fees) must beat entry by TRIM_MIN_NET_PROFIT_CENTS
+
+    Returns (trim_fraction, reason_string) where reason_string explains the decision.
+    """
+    base_frac = _staged_trim_fraction(mark, is_locked)
+    if base_frac == 0.0:
+        return 0.0, "no_band_or_locked"
+
+    # Net profit check: exit must lock in real profit after slippage
+    exit_net = mark - SLIPPAGE_CENTS - FEE_CENTS
+    if exit_net <= entry_price + TRIM_MIN_NET_PROFIT_CENTS - 1:
+        return 0.0, f"no_net_profit(exit_net={exit_net}¢ entry={entry_price}¢)"
+
+    gate = _entry_gate_for_band(mark)
+    if gate is None:
+        # No gate defined for this band — use base fraction as-is
+        return base_frac, "no_gate_defined"
+
+    min_gain_pct, min_gain_cents = gate
+    gain_cents = mark - entry_price
+    gain_pct = gain_cents / entry_price if entry_price > 0 else 0.0
+
+    pct_ok = gain_pct >= min_gain_pct
+    cents_ok = gain_cents >= min_gain_cents
+
+    if pct_ok and cents_ok:
+        return base_frac, f"gate_ok(gain={gain_cents}¢/{gain_pct:.1%})"
+    elif pct_ok or cents_ok:
+        half = base_frac / 2.0
+        which = f"pct={'ok' if pct_ok else 'fail'}({gain_pct:.1%}>={min_gain_pct:.1%}) cents={'ok' if cents_ok else 'fail'}({gain_cents}>={min_gain_cents})"
+        return half, f"gate_partial({which}) → half_trim={half:.2f}"
+    else:
+        return 0.0, f"gate_fail(gain={gain_cents}¢/{gain_pct:.1%} need>={min_gain_cents}¢/{min_gain_pct:.1%})"
 
 
 def _classify_position(
@@ -455,6 +549,7 @@ class DailyState:
     realized_pnl: float = 0.0
     daily_brake_level: int = 0   # 0=none, 1=soft(-3%), 2=medium(-4%), 3=hard(-5%)
     goal_exception_trades: int = 0  # trades allowed past +5% goal (max 2/day)
+    pending_buy_dollars: float = 0.0  # capital reserved by resting buy orders (updated by orchestrator)
 
 
 # ─── PnLTracker ──────────────────────────────────────────────────────────────
@@ -576,14 +671,76 @@ class PnLTracker:
             logger.warning(f"Daily brake SOFT: {pnl_pct * 100:.1f}% drawdown — new entries disabled")
             self._save()
 
+    def get_effective_deployable_capital(self) -> dict:
+        """
+        Returns a conservative accounting of capital that is genuinely free to deploy
+        into new positions.
+
+        effective_available =
+            confirmed_cash_balance
+            - reserve_floor  (anchored to starting_balance, never shrinks)
+            - pending_buy_dollars  (resting buy orders not yet filled)
+
+        The open-position cost basis is NOT subtracted here because it was already
+        spent from cash when the orders executed (Kalshi deducts immediately).
+        pending_buy_dollars covers orders placed but not yet filled.
+
+        Returns a dict with all components for structured logging.
+        """
+        cash = self.state.current_balance
+        reserve = self.state.starting_balance * MIN_CASH_RESERVE_PCT
+        pending_buys = max(0.0, self.state.pending_buy_dollars)
+        open_cost = sum(
+            p.cost_dollars for p in self.state.positions if p.status == "open"
+        )
+
+        # Conservative: subtract pending buy commitments from usable cash.
+        # (open_cost is already reflected in cash deductions from Kalshi.)
+        effective = cash - reserve - pending_buys
+
+        return {
+            "cash_balance": cash,
+            "reserve_floor": reserve,
+            "pending_buy_dollars": pending_buys,
+            "open_position_cost": open_cost,
+            "effective_available": effective,
+        }
+
     def can_trade(self) -> tuple[bool, str]:
         if self.state.trading_halted:
             return False, self.state.halt_reason
-        # Reserve is anchored to starting_balance, not current_balance.
-        # (Using current_balance * 0.20 would make the check always False.)
-        reserve = self.state.starting_balance * MIN_CASH_RESERVE_PCT
-        if self.state.current_balance <= reserve:
-            return False, f"Balance ${self.state.current_balance:.2f} at or below 20% cash reserve (${reserve:.2f})"
+
+        cap = self.get_effective_deployable_capital()
+        cash = cap["cash_balance"]
+        reserve = cap["reserve_floor"]
+        pending = cap["pending_buy_dollars"]
+        effective = cap["effective_available"]
+        open_cost = cap["open_position_cost"]
+
+        logger.info(
+            f"CAN_TRADE_CHECK | cash=${cash:.2f} reserve=${reserve:.2f} "
+            f"pending_buys=${pending:.2f} open_pos_cost=${open_cost:.2f} "
+            f"effective_available=${effective:.2f} | halted={self.state.trading_halted}"
+        )
+
+        # Primary gate: raw cash must clear the reserve floor even before pending
+        if cash <= reserve:
+            reason = (
+                f"Cash ${cash:.2f} at or below 20% reserve floor ${reserve:.2f}"
+            )
+            logger.info(f"CAN_TRADE=NO | {reason}")
+            return False, reason
+
+        # Secondary gate: after subtracting pending buy commitments, must still be positive
+        if effective <= 0:
+            reason = (
+                f"No deployable capital after reserve (${reserve:.2f}) "
+                f"and pending buys (${pending:.2f}); cash=${cash:.2f}"
+            )
+            logger.info(f"CAN_TRADE=NO | {reason}")
+            return False, reason
+
+        logger.info(f"CAN_TRADE=YES | effective_available=${effective:.2f}")
         return True, ""
 
     def is_high_conviction_exception(self, rec) -> bool:
@@ -809,14 +966,27 @@ class PnLTracker:
                 hold_ev = hold_ev / FINAL_HOUR_CONSERVATISM
             exit_ev_adj = exit_ev
 
+            # ── Entry-relative metrics (used in trim gate + logging) ──────────
+            gain_cents = mark - pos.entry_price
+            gain_pct = gain_cents / pos.entry_price if pos.entry_price > 0 else 0.0
+            exit_net = mark - SLIPPAGE_CENTS - FEE_CENTS
+
+            # Determine which trim band the current mark falls in (for logging)
+            _trim_band_label = "none"
+            for _bmin, _bmax, _bfrac in PROFIT_TAKE_BANDS:
+                if _bmin <= mark <= _bmax:
+                    _trim_band_label = f"{_bmin}-{_bmax}¢({_bfrac:.0%}base)"
+                    break
+
             # ── Detailed decision log ─────────────────────────────────────────
             hrs_display = f"{hours_left:.1f}" if hours_left is not None else "N/A"
             logger.info(
                 f"EXIT_EVAL {pos.ticker} {pos.side.upper()} | "
                 f"entry={pos.entry_price}¢ mark={mark}¢ peak={hwm}¢ | "
-                f"state={state} hrs_left={hrs_display} | "
+                f"gain={gain_cents:+d}¢ ({gain_pct:+.1%}) exit_net={exit_net}¢ | "
+                f"trim_band={_trim_band_label} state={state} hrs_left={hrs_display} | "
                 f"hold_ev={hold_ev:.1f}¢ exit_ev={exit_ev_adj:.1f}¢ | "
-                f"pnl=${((mark - pos.entry_price) / 100 * remaining):+.2f} contracts={remaining}"
+                f"pnl=${(gain_cents / 100 * remaining):+.2f} contracts={remaining}"
             )
 
             exit_contracts = 0
@@ -840,8 +1010,20 @@ class PnLTracker:
                 # last-mile slippage risk.
                 if state == STATE_NEAR_LOCKED and mark <= 95:
                     trim_frac = 0.0
+                    gate_reason = "near_locked_suppressed"
                 else:
-                    trim_frac = _staged_trim_fraction(mark, is_locked)
+                    trim_frac, gate_reason = _entry_relative_trim_fraction(
+                        mark, pos.entry_price, is_locked
+                    )
+
+                logger.info(
+                    f"TRIM_GATE {pos.ticker} | "
+                    f"entry={pos.entry_price}¢ mark={mark}¢ band={_trim_band_label} | "
+                    f"gain={gain_cents:+d}¢ ({gain_pct:+.1%}) exit_net={exit_net}¢ | "
+                    f"hold_ev={hold_ev:.1f}¢ exit_ev={exit_ev_adj:.1f}¢ | "
+                    f"trim_frac={trim_frac:.2f} gate={gate_reason}"
+                )
+
                 if trim_frac > 0:
                     trim_count = max(1, math.floor(remaining * trim_frac))
                     # Only trim if we haven't already trimmed this band
@@ -849,6 +1031,13 @@ class PnLTracker:
                     if trim_frac > already_trimmed_frac + 0.05:
                         exit_contracts = trim_count
                         exit_reason = EXIT_STAGED_PROFIT
+                    else:
+                        logger.info(
+                            f"TRIM_SKIP {pos.ticker}: already trimmed "
+                            f"{pos.trimmed_contracts}/{pos.contracts} "
+                            f"({already_trimmed_frac:.1%}) — "
+                            f"trim_frac={trim_frac:.2f} not > already+5%"
+                        )
 
             # ── Priority 4: Progressive trailing stop ─────────────────────────
             if exit_contracts == 0 and hwm >= pos.entry_price * (1 + TRAILING_STOP_ARM_PCT):
@@ -900,6 +1089,216 @@ class PnLTracker:
                 exits.append((pos, mark, exit_contracts, exit_reason))
 
         return exits
+
+    # ── Exitability scoring ───────────────────────────────────────────────────
+
+    def _score_exitability(self, pos, liquidity: dict) -> dict:
+        """
+        Estimate how realistically a position can be exited at a reasonable fill.
+
+        Score is 0–100 (higher = more exitable).
+        Components:
+          - book_depth:   does the book have enough depth to absorb our size?
+          - spread_width: is the spread narrow enough for a fair fill?
+          - best_price:   is there a real bid/ask on our side?
+
+        Returns a dict with score and component breakdown.
+        """
+        side = pos.side
+        best_price = liquidity.get("best_yes_price" if side == "yes" else "best_no_price")
+        spread = liquidity.get("spread")
+        total_volume = liquidity.get("total_volume", 0.0)
+        remaining = pos.contracts - pos.trimmed_contracts
+
+        score = 100
+        flags = []
+
+        # No price at all — cannot exit
+        if not best_price or best_price <= 0:
+            return {
+                "score": 0,
+                "best_price": None,
+                "spread": spread,
+                "total_volume": total_volume,
+                "remaining_contracts": remaining,
+                "flags": ["no_best_price"],
+            }
+
+        # Spread penalty: wide spread makes exit costly
+        if spread is not None:
+            if spread >= STALL_SPREAD_WIDE_CENTS:
+                score -= 30
+                flags.append(f"wide_spread({spread}¢)")
+            elif spread >= STALL_SPREAD_WIDE_CENTS // 2:
+                score -= 15
+                flags.append(f"moderate_spread({spread}¢)")
+
+        # Depth penalty: thin book may not absorb our full size
+        if total_volume < STALL_POOR_LIQUIDITY_DOLLARS:
+            score -= 35
+            flags.append(f"poor_depth(${total_volume:.2f})")
+        elif total_volume < STALL_POOR_LIQUIDITY_DOLLARS * 3:
+            score -= 15
+            flags.append(f"thin_depth(${total_volume:.2f})")
+
+        # Low best price means the exit value itself is minimal
+        if best_price <= 10:
+            score -= 20
+            flags.append(f"very_low_price({best_price}¢)")
+        elif best_price <= 20:
+            score -= 10
+            flags.append(f"low_price({best_price}¢)")
+
+        score = max(0, min(100, score))
+        return {
+            "score": score,
+            "best_price": best_price,
+            "spread": spread,
+            "total_volume": total_volume,
+            "remaining_contracts": remaining,
+            "flags": flags,
+        }
+
+    # ── Stalled / capital-trap classification ─────────────────────────────────
+
+    def classify_stalled_positions(self) -> list[dict]:
+        """
+        Scans all open positions and flags any that appear to be capital traps:
+        poor hold EV, poor exit EV, poor liquidity, no favorable excursion, and
+        sufficient age that we can be confident the trade has stagnated.
+
+        Returns a list of report dicts — one per flagged position — containing:
+          ticker, side, age_minutes, mark, hold_ev, exit_ev, exitability_score,
+          spread, total_volume, stall_flags, action, state.
+
+        Does NOT execute any exits. Callers decide what to do with the reports.
+        """
+        if not self.kalshi:
+            return []
+
+        reports = []
+        now_utc = datetime.now(timezone.utc)
+
+        for pos in self.state.positions:
+            if pos.status != "open":
+                continue
+
+            remaining = pos.contracts - pos.trimmed_contracts
+            if remaining <= 0:
+                continue
+
+            # Age check — only consider positions old enough to have developed
+            age_minutes = 0.0
+            if pos.placed_at:
+                try:
+                    placed_dt = datetime.fromisoformat(pos.placed_at.replace("Z", "+00:00"))
+                    age_minutes = (now_utc - placed_dt).total_seconds() / 60
+                except Exception:
+                    pass
+            if age_minutes < STALL_MIN_AGE_MINUTES:
+                continue
+
+            # Get current market data
+            try:
+                liquidity = self.kalshi.get_liquidity(pos.ticker)
+            except Exception as e:
+                logger.debug(f"STALL_CHECK: liquidity fetch failed for {pos.ticker}: {e}")
+                continue
+
+            mark = liquidity.get("best_yes_price" if pos.side == "yes" else "best_no_price")
+            if not mark or mark <= 0:
+                mark = 0
+
+            close_time_str = _get_close_time(pos.ticker, self.kalshi)
+            hours_left = _hours_to_settlement(close_time_str)
+
+            weather_report = None
+            if self.weather:
+                try:
+                    city = self._infer_city(pos.ticker)
+                    if city:
+                        weather_report = self.weather.get_full_report(city)
+                except Exception:
+                    pass
+
+            state = _classify_position(pos, mark, hours_left, weather_report) if mark > 0 else STATE_LIVE
+            hold_ev = _model_hold_value(pos, mark, state, hours_left, weather_report) if mark > 0 else 0.0
+            exit_ev = (mark - SLIPPAGE_CENTS - FEE_CENTS) if mark > 0 else 0.0
+            exitability = self._score_exitability(pos, liquidity)
+
+            # ── Stall scoring: count how many concern flags apply ─────────────
+            stall_flags = []
+
+            if state == STATE_BROKEN:
+                # Broken positions are handled by check_profit_takes; skip stall logic
+                continue
+            if state in (STATE_LOCKED, STATE_NEAR_LOCKED):
+                # These are fine — capital is working
+                continue
+
+            if hold_ev < STALL_HOLD_EV_CEILING:
+                stall_flags.append(f"weak_hold_ev({hold_ev:.1f}¢)")
+
+            if exit_ev < STALL_EXIT_EV_CEILING:
+                stall_flags.append(f"weak_exit_ev({exit_ev:.1f}¢)")
+
+            spread = liquidity.get("spread")
+            if spread is not None and spread >= STALL_SPREAD_WIDE_CENTS:
+                stall_flags.append(f"wide_spread({spread}¢)")
+
+            if liquidity.get("total_volume", 0.0) < STALL_POOR_LIQUIDITY_DOLLARS:
+                stall_flags.append(f"poor_liquidity(${liquidity.get('total_volume', 0):.2f})")
+
+            hwm = pos.high_water_mark if pos.high_water_mark is not None else pos.entry_price
+            if hwm <= pos.entry_price + STALL_MFE_REQUIRED_CENTS:
+                stall_flags.append(f"no_favorable_excursion(hwm={hwm}¢ entry={pos.entry_price}¢)")
+
+            if hours_left is not None and hours_left < 1.0 and mark <= 30:
+                stall_flags.append(f"late_and_losing(hrs={hours_left:.1f} mark={mark}¢)")
+
+            is_stalled = len(stall_flags) >= STALL_SCORE_THRESHOLD
+
+            if is_stalled:
+                # Determine recommended action based on severity
+                if exitability["score"] >= 50 and exit_ev > 5:
+                    action = "escalate_fair_value_exit"
+                elif exitability["score"] >= 20 and exit_ev > 2:
+                    action = "attempt_partial_reduction"
+                else:
+                    action = "monitor_and_log"
+
+                report = {
+                    "ticker": pos.ticker,
+                    "side": pos.side,
+                    "age_minutes": round(age_minutes, 1),
+                    "mark_cents": mark,
+                    "entry_price_cents": pos.entry_price,
+                    "hold_ev": round(hold_ev, 2),
+                    "exit_ev": round(exit_ev, 2),
+                    "exitability_score": exitability["score"],
+                    "exitability_flags": exitability["flags"],
+                    "spread_cents": spread,
+                    "total_volume_dollars": liquidity.get("total_volume", 0.0),
+                    "hours_left": hours_left,
+                    "state": state,
+                    "stall_flags": stall_flags,
+                    "stall_flag_count": len(stall_flags),
+                    "action": action,
+                    "remaining_contracts": remaining,
+                    "cost_dollars": pos.cost_dollars,
+                }
+
+                logger.warning(
+                    f"STALLED_POSITION {pos.ticker} {pos.side.upper()} | "
+                    f"age={age_minutes:.0f}min mark={mark}¢ state={state} | "
+                    f"hold_ev={hold_ev:.1f}¢ exit_ev={exit_ev:.1f}¢ "
+                    f"exitability={exitability['score']}/100 | "
+                    f"flags={stall_flags} | action={action}"
+                )
+
+                reports.append(report)
+
+        return reports
 
     def _infer_city(self, ticker: str) -> Optional[str]:
         """Infer city name from ticker prefix using engine's series map."""
