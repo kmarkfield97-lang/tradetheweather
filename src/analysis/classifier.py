@@ -17,6 +17,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
+# ── P&L threshold separating wins/losses from scratches ──────────────────────
+# Trades within ±SCRATCH_PNL_THRESHOLD are "scratch" (flat exit) — not wins or
+# losses. Exported so history.py and advisor.py can use the same constant.
+SCRATCH_PNL_THRESHOLD = 0.05
+
 # ── Minimum sample sizes before a pattern becomes actionable ─────────────────
 MIN_SAMPLES_MONITOR = 5       # below this: P3 only
 MIN_SAMPLES_CONSIDER = 15     # below this: raise edge, do not avoid
@@ -118,6 +123,12 @@ class RootCauseTags:
     should_have_exited_earlier: bool = False
     should_have_held_longer: bool = False
     correlation_issue: bool = False
+    # ── New tags added for richer diagnostics ────────────────────────────────
+    low_edge_entry: bool = False       # edge was below tier threshold at entry
+    poor_sell_timing: bool = False     # exit timing clearly suboptimal (evidence-based)
+    halt_side_effects: bool = False    # daily brake forced an exit at bad price
+    normal_variance: bool = False      # outcome within expected range for this sigma
+    insufficient_telemetry: bool = False  # no entry snapshot stored — can't diagnose
 
     def to_dict(self) -> dict:
         return {
@@ -137,6 +148,11 @@ class RootCauseTags:
             "should_have_exited_earlier": self.should_have_exited_earlier,
             "should_have_held_longer": self.should_have_held_longer,
             "correlation_issue": self.correlation_issue,
+            "low_edge_entry": self.low_edge_entry,
+            "poor_sell_timing": self.poor_sell_timing,
+            "halt_side_effects": self.halt_side_effects,
+            "normal_variance": self.normal_variance,
+            "insufficient_telemetry": self.insufficient_telemetry,
         }
 
 
@@ -181,6 +197,13 @@ class StructuredLesson:
     safe_for_auto_fix: bool = False
     change_type: Optional[str] = None       # key in CHANGE_TYPE_POLICY
     notes: str = ""
+    # ── New diagnostic fields ─────────────────────────────────────────────────
+    primary_root_cause: str = "insufficient_telemetry"  # stable string key for day-level rollup
+    exit_reason: str = ""                   # normalised exit reason category
+    mfe_cents: Optional[int] = None         # max favourable excursion (high_water_mark)
+    mae_cents: Optional[int] = None         # max adverse excursion (low_water_mark)
+    fragile_flags: list = field(default_factory=list)   # e.g. ["low_price_entry"]
+    entry_snapshot_available: bool = False  # True when entry_our_prob etc. were stored
 
     def to_dict(self) -> dict:
         return {
@@ -198,6 +221,12 @@ class StructuredLesson:
             "safe_for_auto_fix": self.safe_for_auto_fix,
             "change_type": self.change_type,
             "notes": self.notes,
+            "primary_root_cause": self.primary_root_cause,
+            "exit_reason": self.exit_reason,
+            "mfe_cents": self.mfe_cents,
+            "mae_cents": self.mae_cents,
+            "fragile_flags": self.fragile_flags,
+            "entry_snapshot_available": self.entry_snapshot_available,
         }
 
 
@@ -255,8 +284,11 @@ def classify_city_penalty(
     """
     n = len(pnls)
     total = sum(pnls)
-    wins = sum(1 for p in pnls if p > 0)
-    win_rate = wins / n if n > 0 else 0.0
+    # Exclude scratches from win-rate denominator so flat exits don't suppress win rate.
+    wins = sum(1 for p in pnls if p > SCRATCH_PNL_THRESHOLD)
+    scratch_count = sum(1 for p in pnls if abs(p) <= SCRATCH_PNL_THRESHOLD)
+    decided = n - scratch_count
+    win_rate = wins / decided if decided > 0 else 0.0
 
     penalty = CityPerformancePenalty(
         city=city,
@@ -388,36 +420,56 @@ def classify_finding_severity(
     return sev, action, safe
 
 
-def derive_structured_lesson(position: dict, won: bool) -> StructuredLesson:
+def derive_structured_lesson(position: dict) -> StructuredLesson:
     """
     Generates a StructuredLesson for a closed position.
 
     Uses available position fields to infer root cause and decomposition.
     All inferences are conservative — defaults to 'unavoidable_variance'
     when evidence is insufficient.
+
+    The `won` parameter has been removed. Outcome is computed internally
+    from pnl using the shared SCRATCH_PNL_THRESHOLD so scratches are never
+    misclassified as losses.
     """
     ticker = position.get("ticker", "")
     pnl = position.get("pnl_dollars", 0.0)
     side = position.get("side", "")
     entry = position.get("entry_price", 0)
     exit_p = position.get("exit_price")
-    exit_reason = position.get("exit_reason", "")
+    exit_reason_raw = position.get("exit_reason", "") or ""
     market_type = position.get("market_type", "")
     city = position.get("city", "")
     model_unc = position.get("model_uncertainty", 0.3)
 
+    # ── New fields from entry snapshot (optional — present only if logging active) ──
+    entry_our_prob    = position.get("entry_our_prob")
+    entry_edge        = position.get("entry_edge")
+    entry_sigma       = position.get("entry_sigma")
+    entry_hours_left  = position.get("entry_hours_left")
+    mfe_cents         = position.get("high_water_mark")   # peak price seen
+    mae_cents         = position.get("low_water_mark")    # worst price seen
+    fragile_flags     = list(position.get("fragile_flags", []) or [])
+    has_snapshot      = entry_our_prob is not None
+
+    # Normalised exit reason category (stable string)
+    exit_reason_cat = _categorize_exit_reason_lesson(exit_reason_raw)
+
+    # ── Three-class outcome ───────────────────────────────────────────────────
     outcome: Literal["win", "loss", "scratch"]
-    if pnl > 0.05:
+    if pnl > SCRATCH_PNL_THRESHOLD:
         outcome = "win"
-    elif pnl < -0.05:
+    elif pnl < -SCRATCH_PNL_THRESHOLD:
         outcome = "loss"
     else:
         outcome = "scratch"
 
+    won = (outcome == "win")
+
     tags = RootCauseTags()
     decomp = OutcomeDecomposition()
 
-    # ── Entry quality ────────────────────────────────────────────────────────
+    # ── Entry quality ─────────────────────────────────────────────────────────
     if model_unc > 0.6:
         tags.entry_quality = "poor"
         tags.sizing_issue = True
@@ -426,26 +478,47 @@ def derive_structured_lesson(position: dict, won: bool) -> StructuredLesson:
     else:
         tags.entry_quality = "neutral"
 
-    # ── Exit quality ────────────────────────────────────────────────────────
-    if exit_reason:
-        if "staged_profit" in exit_reason or "trailing_stop" in exit_reason:
-            tags.exit_quality = "good" if won else "neutral"
-        elif "thesis_invalidated" in exit_reason:
-            tags.exit_quality = "good"      # correct to cut quickly
-            tags.forecast_error_driver = True
-        elif "salvage_stop" in exit_reason:
-            tags.exit_quality = "poor"      # position deteriorated to fail-safe
-        elif "fair_value" in exit_reason and not won:
-            tags.exit_quality = "neutral"
-        elif "daily_brake" in exit_reason:
-            tags.exit_quality = "neutral"
+    # Entry edge flag: edge < 7¢ is below the conservative tier threshold
+    if entry_edge is not None and abs(entry_edge) < 0.07:
+        tags.low_edge_entry = True
 
-    # ── Late-day path failure ────────────────────────────────────────────────
-    if market_type in ("temp_high", "temp_low") and not won:
-        if exit_reason and "thesis_invalidated" in exit_reason:
+    # ── Exit quality ──────────────────────────────────────────────────────────
+    if exit_reason_cat == "thesis_invalidation":
+        tags.exit_quality = "good"      # correct to cut quickly
+        tags.forecast_error_driver = True
+        if market_type in ("temp_high", "temp_low") and outcome == "loss":
             tags.late_day_path_failure = True
+    elif exit_reason_cat in ("staged_profit", "trailing_stop"):
+        tags.exit_quality = "good" if won else "neutral"
+    elif exit_reason_cat == "salvage":
+        tags.exit_quality = "poor"      # position deteriorated to fail-safe
+    elif exit_reason_cat == "daily_halt":
+        tags.exit_quality = "neutral"
+        tags.halt_side_effects = True
+    elif exit_reason_cat == "fair_value":
+        tags.exit_quality = "neutral"
 
-    # ── Outcome decomposition ────────────────────────────────────────────────
+    # MAE signal: if position immediately went against us (low_water_mark < entry),
+    # that's evidence of a model or timing issue.
+    if mae_cents is not None and entry > 0 and mae_cents < entry * 0.70:
+        # Dropped to <70% of entry quickly — adverse from the start
+        if outcome == "loss":
+            tags.model_error = True
+
+    # ── Fragile-trade tags → root cause hints ────────────────────────────────
+    if "low_price_entry" in fragile_flags and outcome == "loss":
+        # Low-price contracts have high delta variance — often unavoidable
+        tags.normal_variance = True
+    if "same_day_entry" in fragile_flags and outcome == "loss":
+        tags.late_day_path_failure = True
+    if "model_market_disagreement" in fragile_flags:
+        tags.should_not_have_traded = True
+
+    # ── Telemetry gap flag ───────────────────────────────────────────────────
+    if not has_snapshot:
+        tags.insufficient_telemetry = True
+
+    # ── Outcome decomposition ─────────────────────────────────────────────────
     if outcome == "loss":
         if tags.stale_data_issue or tags.execution_issue:
             decomp.bad_execution = 0.6
@@ -460,23 +533,29 @@ def derive_structured_lesson(position: dict, won: bool) -> StructuredLesson:
         elif tags.exit_quality == "poor":
             decomp.bad_exit_timing = 0.5
             decomp.unavoidable_variance = 0.5
+        elif tags.normal_variance:
+            decomp.unavoidable_variance = 0.8
+            decomp.bad_prediction = 0.2
         else:
             # No strong signal — attribute to variance
             decomp.unavoidable_variance = 0.7
             decomp.bad_prediction = 0.3
+    elif outcome == "scratch":
+        # Scratch: attribute entirely to market conditions / thin edge
+        decomp.unavoidable_variance = 1.0
     else:
-        # Win — attribute primarily to correct prediction, some variance
+        # Win
         decomp.bad_prediction = 0.0
         decomp.unavoidable_variance = 0.4
 
-    # ── Severity classification ──────────────────────────────────────────────
+    # ── Severity classification ───────────────────────────────────────────────
     if tags.execution_issue or tags.stale_data_issue:
         sev: Severity = "P0"
         action: RecommendedAction = "auto_apply_safe"
         safe = True
         change_type = "stale_data_guard" if tags.stale_data_issue else "error_handling"
         evidence: EvidenceStrength = "moderate"
-    elif tags.model_error and not won:
+    elif tags.model_error and outcome == "loss":
         sev = "P2"
         action = "queue_for_review"
         safe = False
@@ -495,27 +574,35 @@ def derive_structured_lesson(position: dict, won: bool) -> StructuredLesson:
         change_type = None
         evidence = "anecdotal"
 
-    # ── Human-readable lesson ────────────────────────────────────────────────
-    if won:
-        lesson_text = (
-            f"WIN [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
-            f"exit={exit_p}¢ pnl=${pnl:+.2f}. "
-            f"Entry quality: {tags.entry_quality}. Signal was correct."
-        )
-    else:
-        decomp_dict = decomp.to_dict()
-        primary_driver = max(decomp_dict, key=lambda k: decomp_dict[k])
-        lesson_text = (
-            f"LOSS [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
-            f"exit={exit_p}¢ pnl=${pnl:+.2f}. "
-            f"Primary driver: {primary_driver}. "
-            f"Exit: {exit_reason or 'unknown'}. "
-            f"Action: {action}."
-        )
+    # ── Primary root cause (stable string for day-level rollup) ──────────────
+    primary_root_cause = _derive_primary_root_cause(tags, outcome)
 
-    confidence = 0.3 if outcome != "scratch" else 0.1
+    # ── Human-readable lesson ─────────────────────────────────────────────────
+    lesson_text = _build_lesson_text(
+        outcome=outcome,
+        sev=sev,
+        ticker=ticker,
+        side=side,
+        entry=entry,
+        exit_p=exit_p,
+        pnl=pnl,
+        exit_reason_cat=exit_reason_cat,
+        tags=tags,
+        decomp=decomp,
+        action=action,
+        mfe_cents=mfe_cents,
+        mae_cents=mae_cents,
+        fragile_flags=fragile_flags,
+        has_snapshot=has_snapshot,
+        entry_edge=entry_edge,
+        entry_hours_left=entry_hours_left,
+    )
+
+    confidence = 0.1 if outcome == "scratch" else 0.3
     if tags.execution_issue or tags.stale_data_issue:
         confidence = 0.7
+    if not has_snapshot:
+        confidence = min(confidence, 0.2)   # cap confidence when telemetry is missing
 
     return StructuredLesson(
         ticker=ticker,
@@ -531,6 +618,141 @@ def derive_structured_lesson(position: dict, won: bool) -> StructuredLesson:
         needs_more_data=(action in ("collect_more_data", "monitor_only")),
         safe_for_auto_fix=safe,
         change_type=change_type,
+        primary_root_cause=primary_root_cause,
+        exit_reason=exit_reason_cat,
+        mfe_cents=mfe_cents,
+        mae_cents=mae_cents,
+        fragile_flags=fragile_flags,
+        entry_snapshot_available=has_snapshot,
+    )
+
+
+# ── Exit reason normalisation (local to classifier) ───────────────────────────
+# Mirrors the one in history.py but kept here to avoid a circular import.
+_LESSON_EXIT_PREFIXES = [
+    ("thesis_invalidat", "thesis_invalidation"),
+    ("staged_profit",    "staged_profit"),
+    ("trailing_stop",    "trailing_stop"),
+    ("fair_value",       "fair_value"),
+    ("salvage_stop",     "salvage"),
+    ("daily_brake",      "daily_halt"),
+    ("daily_halt",       "daily_halt"),
+    ("expired",          "expired"),
+]
+
+
+def _categorize_exit_reason_lesson(exit_reason: str) -> str:
+    if not exit_reason:
+        return "unknown"
+    er = exit_reason.lower()
+    for prefix, category in _LESSON_EXIT_PREFIXES:
+        if prefix in er:
+            return category
+    return "other"
+
+
+def _derive_primary_root_cause(tags: RootCauseTags, outcome: str) -> str:
+    """
+    Returns a single stable string identifying the primary root cause.
+    Used for day-level rollup in day_diagnosis.root_cause_summary.
+
+    Priority waterfall (first matching tag wins):
+      1. execution_issue / stale_data_issue  → "execution_issue"
+      2. insufficient_telemetry              → "insufficient_telemetry"
+      3. halt_side_effects                   → "halt_side_effects"
+      4. model_error                         → "model_error"
+      5. forecast_error_driver               → "forecast_error"
+      6. sizing_issue                        → "sizing_issue"
+      7. low_edge_entry                      → "low_edge"
+      8. normal_variance                     → "normal_variance"
+      9. scratch outcome                     → "scratch_no_edge"
+      10. fallback                           → "normal_variance"
+    """
+    if tags.execution_issue or tags.stale_data_issue:
+        return "execution_issue"
+    if tags.insufficient_telemetry:
+        return "insufficient_telemetry"
+    if tags.halt_side_effects:
+        return "halt_side_effects"
+    if tags.model_error:
+        return "model_error"
+    if tags.forecast_error_driver:
+        return "forecast_error"
+    if tags.sizing_issue:
+        return "sizing_issue"
+    if tags.low_edge_entry:
+        return "low_edge"
+    if tags.normal_variance or outcome == "scratch":
+        return "normal_variance"
+    return "normal_variance"
+
+
+def _build_lesson_text(
+    *,
+    outcome: str,
+    sev: str,
+    ticker: str,
+    side: str,
+    entry: int,
+    exit_p,
+    pnl: float,
+    exit_reason_cat: str,
+    tags: RootCauseTags,
+    decomp: OutcomeDecomposition,
+    action: str,
+    mfe_cents: Optional[int],
+    mae_cents: Optional[int],
+    fragile_flags: list,
+    has_snapshot: bool,
+    entry_edge: Optional[float],
+    entry_hours_left: Optional[float],
+) -> str:
+    """Builds a human-readable lesson string that reflects the three-class outcome."""
+    edge_str = f" edge={entry_edge*100:.1f}¢" if entry_edge is not None else ""
+    hours_str = f" {entry_hours_left:.1f}h-to-close" if entry_hours_left is not None else ""
+    excursion_str = ""
+    if mfe_cents is not None or mae_cents is not None:
+        mfe_part = f"MFE={mfe_cents}¢" if mfe_cents is not None else ""
+        mae_part = f"MAE={mae_cents}¢" if mae_cents is not None else ""
+        excursion_str = f" [{' '.join(x for x in [mfe_part, mae_part] if x)}]"
+    fragile_str = f" [{','.join(fragile_flags)}]" if fragile_flags else ""
+    telemetry_note = "" if has_snapshot else " [no entry snapshot]"
+
+    if outcome == "win":
+        return (
+            f"WIN [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
+            f"exit={exit_p}¢ pnl=${pnl:+.2f}{edge_str}{hours_str}{excursion_str}"
+            f"{fragile_str}. Entry quality: {tags.entry_quality}. "
+            f"Exit: {exit_reason_cat}. Signal was correct."
+        )
+
+    if outcome == "scratch":
+        exit_note = ""
+        if exit_reason_cat == "daily_halt":
+            exit_note = "Halt cleanup — not an edge failure."
+        elif exit_reason_cat == "fair_value":
+            exit_note = "Fair-value exit — market and model agreed on thin edge."
+        elif exit_reason_cat == "unknown":
+            exit_note = "Exit reason not recorded."
+        else:
+            exit_note = f"Exit: {exit_reason_cat}."
+        return (
+            f"SCRATCH [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
+            f"exit={exit_p}¢ pnl=${pnl:+.2f}{edge_str}{hours_str}{excursion_str}"
+            f"{fragile_str}{telemetry_note}. {exit_note} "
+            f"Action: {action}."
+        )
+
+    # Loss
+    decomp_dict = decomp.to_dict()
+    primary_driver = max(decomp_dict, key=lambda k: decomp_dict[k])
+    return (
+        f"LOSS [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
+        f"exit={exit_p}¢ pnl=${pnl:+.2f}{edge_str}{hours_str}{excursion_str}"
+        f"{fragile_str}{telemetry_note}. "
+        f"Primary driver: {primary_driver}. "
+        f"Exit: {exit_reason_cat}. "
+        f"Action: {action}."
     )
 
 

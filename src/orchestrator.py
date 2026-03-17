@@ -202,7 +202,7 @@ class Orchestrator:
 
             # Check per-position exits (profit takes, trailing stops, thesis invalidation)
             profit_takes = self.tracker.check_profit_takes()
-            for position, exit_price, contracts_to_exit in profit_takes:
+            for position, exit_price, contracts_to_exit, exit_reason in profit_takes:
                 try:
                     if contracts_to_exit <= 0:
                         logger.warning(f"Skipping exit for {position.ticker}: contracts_to_exit={contracts_to_exit}")
@@ -227,7 +227,10 @@ class Orchestrator:
 
                     if order_status == "executed":
                         # Filled immediately — record and notify
-                        self.tracker.record_exit(position.order_id, exit_price, pnl, contracts_to_exit)
+                        self.tracker.record_exit(
+                            position.order_id, exit_price, pnl, contracts_to_exit,
+                            exit_reason=exit_reason,
+                        )
                         reconciled = await self._reconcile_exit(
                             position.ticker, position.side, position.contracts, contracts_to_exit
                         )
@@ -241,11 +244,15 @@ class Orchestrator:
                             await self.bot.send_alert(msg)
                         logger.info(msg)
                     elif exit_order_id:
-                        # Order is resting — store pending, notify when filled
-                        self._pending_exits[exit_order_id] = (position, exit_price, contracts_to_exit, pnl, is_partial)
+                        # Order is resting — store pending with exit_reason so it
+                        # is recorded when the order fills in _check_order_fills.
+                        self._pending_exits[exit_order_id] = (
+                            position, exit_price, contracts_to_exit, pnl, is_partial, exit_reason
+                        )
                         logger.info(
                             f"Exit order resting: {position.ticker} {position.side.upper()} "
-                            f"{contracts_to_exit}x @ {exit_price}¢ | order_id={exit_order_id}"
+                            f"{contracts_to_exit}x @ {exit_price}¢ | order_id={exit_order_id} "
+                            f"reason={exit_reason}"
                         )
                     else:
                         logger.warning(f"Exit order for {position.ticker} returned no order_id and status='{order_status}'")
@@ -269,10 +276,20 @@ class Orchestrator:
             filled_ids = self._known_resting_ids - current_ids
             for oid in filled_ids:
                 if oid in self._pending_exits:
-                    # A bot-placed exit order just filled — record and notify
-                    position, exit_price, contracts_to_exit, pnl, is_partial = self._pending_exits.pop(oid)
+                    # A bot-placed exit order just filled — record and notify.
+                    # Unpack 6-tuple (position, exit_price, contracts, pnl, is_partial, exit_reason).
+                    pending = self._pending_exits.pop(oid)
+                    if len(pending) == 6:
+                        position, exit_price, contracts_to_exit, pnl, is_partial, exit_reason = pending
+                    else:
+                        # Legacy 5-tuple (no exit_reason) — degrade gracefully
+                        position, exit_price, contracts_to_exit, pnl, is_partial = pending
+                        exit_reason = ""
                     self._bot_exit_order_ids.discard(oid)
-                    self.tracker.record_exit(position.order_id, exit_price, pnl, contracts_to_exit)
+                    self.tracker.record_exit(
+                        position.order_id, exit_price, pnl, contracts_to_exit,
+                        exit_reason=exit_reason,
+                    )
                     msg = (
                         f"{'Partial exit' if is_partial else 'Profit take'}: {position.ticker} {position.side.upper()} "
                         f"{contracts_to_exit}/{position.contracts} contracts @ {exit_price}¢ | P&L: ${pnl:+.2f}"
@@ -519,6 +536,7 @@ class Orchestrator:
                 city=rec.city,
                 market_type=rec.market_type,
                 model_uncertainty=getattr(rec, "model_uncertainty", 0.3),
+                entry_context=getattr(rec, "entry_context", None),
             )
 
             logger.info(

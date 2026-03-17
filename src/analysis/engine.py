@@ -131,6 +131,11 @@ class TradeRecommendation:
     # ── Per-signal breakdown for offline analysis / future weight optimization ──
     signal_breakdown: list[dict] = field(default_factory=list)
     weights_version: str = "fallback"   # version of signal_weights.json active at score time
+    # ── Full decision context (populated by _evaluate_market) ────────────────
+    # Carries all fields needed to reconstruct the entry decision snapshot.
+    # Passed through to record_trade() as entry_context so diagnostics have
+    # the full picture of why the trade was entered.
+    entry_context: dict = field(default_factory=dict)
 
 
 class TradeAnalysisEngine:
@@ -882,6 +887,29 @@ class TradeAnalysisEngine:
         except Exception as _shadow_err:
             logger.debug(f"shadow_log failed for {ticker}: {_shadow_err}")
 
+        # ── Build entry context snapshot ──────────────────────────────────────
+        # Contains every field needed to reconstruct the decision at entry time.
+        # Stored on the Position via record_trade(entry_context=...) so that
+        # post-trade diagnostics and the classifier have the full picture.
+        entry_ctx: dict = {
+            "our_prob":            round(our_prob, 4),
+            "base_prob":           round(base_prob, 4),
+            "signal_adj":          round(adj, 4),
+            "edge":                round(edge, 4),
+            "sigma_f":             round(sigma, 2),
+            "hours_left":          hours_left,
+            "cap_regime":          agg.cap_regime,
+            "signal_agreement":    round(agg.signal_agreement, 3),
+            "model_uncertainty":   round(agg.model_uncertainty, 3),
+            "extreme_disagreement": extreme_disagreement,
+            "spread":              (liquidity.get("spread") or
+                                    (liquidity.get("best_ask_price", 50) -
+                                     liquidity.get("best_bid_price", 50))),
+            "exec_liq":            round(exec_liq, 2),
+            "weights_version":     agg.weights_version,
+            "signal_breakdown":    signal_breakdown,
+        }
+
         return TradeRecommendation(
             ticker=ticker,
             market_title=title,
@@ -901,6 +929,7 @@ class TradeAnalysisEngine:
             model_uncertainty=round(agg.model_uncertainty, 3),
             signal_breakdown=signal_breakdown,
             weights_version=agg.weights_version,
+            entry_context=entry_ctx,
         )
 
     # ─────────────────────────────────────────────────────────────────────────

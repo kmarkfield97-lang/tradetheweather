@@ -32,6 +32,7 @@ from src.analysis.classifier import (
     EvidenceStrength,
     RecommendedAction,
     Severity,
+    SCRATCH_PNL_THRESHOLD,
     classify_city_penalty,
     classify_finding_severity,
     compute_evidence_strength,
@@ -39,6 +40,16 @@ from src.analysis.classifier import (
     MIN_SAMPLES_CONSIDER,
     MIN_SAMPLES_PENALIZE,
 )
+
+# ── Learning safeguard constants ──────────────────────────────────────────────
+# When the account balance is below this threshold, strategy-change recommendations
+# are capped at observe_only regardless of statistical results, because percentage
+# swings on tiny accounts are not meaningful evidence.
+SAFEGUARD_MIN_BALANCE_FOR_STRATEGY_CHANGE = 20.0
+
+# Require at least this many distinct trading days before allowing non-trivial
+# city or market-type penalty recommendations (prevents single-day overreaction).
+SAFEGUARD_MIN_DAYS_FOR_PENALTY = 3
 
 # ── Adaptation maturity tiers ─────────────────────────────────────────────────
 # Every recommendation is classified into one of these tiers before it can be
@@ -346,6 +357,59 @@ class StructuredAdvisor:
             json.dump(log, f, indent=2)
 
     # -------------------------------------------------------------------------
+    # Safeguard context
+    # -------------------------------------------------------------------------
+
+    def _get_safeguard_context(self) -> dict:
+        """
+        Returns a dict describing whether current account/data conditions are
+        sufficient for non-trivial strategy-change recommendations.
+
+        Safeguards:
+          - account_too_small: last known balance < SAFEGUARD_MIN_BALANCE_FOR_STRATEGY_CHANGE
+          - too_few_days: fewer than SAFEGUARD_MIN_DAYS_FOR_PENALTY distinct trading days
+          - note: human-readable explanation for recommendation text
+
+        When either safeguard is active, city/type penalty recommendations should
+        be capped at observe_only / collect_more_data.
+        """
+        # Last known balance from most recent history record
+        last_balance = 50.0
+        if self._history:
+            last_record = self._history[-1]
+            last_balance = last_record.get("ending_balance",
+                           last_record.get("starting_balance", 50.0))
+
+        days_traded = len(self._history)
+
+        account_too_small = last_balance < SAFEGUARD_MIN_BALANCE_FOR_STRATEGY_CHANGE
+        too_few_days      = days_traded < SAFEGUARD_MIN_DAYS_FOR_PENALTY
+
+        notes = []
+        if account_too_small:
+            notes.append(
+                f"Account balance is small (${last_balance:.2f} < "
+                f"${SAFEGUARD_MIN_BALANCE_FOR_STRATEGY_CHANGE:.0f} threshold). "
+                "P&L percentages are high-variance on small accounts. "
+                "Capping recommendations at observe_only."
+            )
+        if too_few_days:
+            notes.append(
+                f"Only {days_traded} day(s) of history (need "
+                f"{SAFEGUARD_MIN_DAYS_FOR_PENALTY} before penalty recommendations). "
+                "Capping at collect_more_data."
+            )
+
+        return {
+            "account_too_small": account_too_small,
+            "too_few_days": too_few_days,
+            "safeguard_active": account_too_small or too_few_days,
+            "last_balance": last_balance,
+            "days_traded": days_traded,
+            "note": " ".join(notes) if notes else "",
+        }
+
+    # -------------------------------------------------------------------------
     # Analysis sub-routines
     # -------------------------------------------------------------------------
 
@@ -359,6 +423,8 @@ class StructuredAdvisor:
 
     def _analyze_city_performance(self) -> list[AdvisorRecommendation]:
         """Generates city-level edge penalty recommendations."""
+        safeguard = self._get_safeguard_context()
+
         city_pnl: dict[str, list[float]] = {}
         city_exit_reasons: dict[str, list[str]] = {}
         for pos in self._all_closed_positions():
@@ -376,19 +442,59 @@ class StructuredAdvisor:
             if penalty.action == "monitor":
                 continue
 
+            # ── Safeguard: downgrade to observe_only on tiny accounts or thin data ──
+            if safeguard["safeguard_active"]:
+                # Still surface the finding but cap at collect_more_data
+                rec = AdvisorRecommendation(
+                    id=f"city_penalty_{city.lower()}_{len(pnls)}t",
+                    title=f"City performance signal (safeguarded): {city}",
+                    category="city_performance",
+                    change_type="edge_threshold",
+                    severity="P3",
+                    confidence=min(penalty.confidence, 0.2),
+                    evidence_strength="anecdotal",
+                    sample_size=len(pnls),
+                    affected_cities=[city],
+                    likely_root_cause=penalty.classification,
+                    recommended_action="collect_more_data",
+                    auto_apply_allowed=False,
+                    manual_review_required=True,
+                    rollback_risk="low",
+                    proposed_change_summary=(
+                        f"[SAFEGUARDED] {city} shows {penalty.action} signal but "
+                        f"evidence is too thin to act. {safeguard['note']}"
+                    ),
+                    expected_impact="N/A — safeguard active",
+                    risk_of_change="Premature penalty could remove valid trade opportunities",
+                    adaptation_maturity=MATURITY_OBSERVE_ONLY,
+                )
+                recs.append(rec)
+                continue
+
             change_id = f"city_penalty_{city.lower()}_{len(pnls)}t"
+            # Use scratch-excluded loss rate for evidence strength
+            decided = sum(1 for p in pnls if abs(p) > SCRATCH_PNL_THRESHOLD)
+            loss_rate = (sum(1 for p in pnls if p < -SCRATCH_PNL_THRESHOLD) / decided
+                         if decided > 0 else 0.0)
+            evidence = compute_evidence_strength(len(pnls), loss_rate)
+
             sev, action, safe = classify_finding_severity(
                 change_type="avoid_city" if penalty.action == "avoid" else "edge_threshold",
-                evidence=compute_evidence_strength(
-                    len(pnls),
-                    (sum(1 for p in pnls if p < 0) / len(pnls)) if pnls else 0,
-                ),
+                evidence=evidence,
                 sample_size=len(pnls),
                 has_log_proof=False,
                 increases_risk=False,  # raising edge reduces risk
             )
 
             policy = CHANGE_TYPE_POLICY.get("avoid_city", "review")
+            # Scratch-excluded baseline win rate for post-change monitor
+            scratch_count = sum(1 for p in pnls if abs(p) <= SCRATCH_PNL_THRESHOLD)
+            decided_for_monitor = len(pnls) - scratch_count
+            baseline_wr = (
+                sum(1 for p in pnls if p > SCRATCH_PNL_THRESHOLD) / decided_for_monitor
+                if decided_for_monitor > 0 else 0.0
+            )
+
             rec = AdvisorRecommendation(
                 id=change_id,
                 title=f"City performance penalty: {city}",
@@ -396,10 +502,7 @@ class StructuredAdvisor:
                 change_type="avoid_city" if penalty.action == "avoid" else "edge_threshold",
                 severity=sev,
                 confidence=penalty.confidence,
-                evidence_strength=compute_evidence_strength(
-                    len(pnls),
-                    sum(1 for p in pnls if p < 0) / len(pnls),
-                ),
+                evidence_strength=evidence,
                 sample_size=len(pnls),
                 affected_cities=[city],
                 likely_root_cause=penalty.classification,
@@ -411,7 +514,8 @@ class StructuredAdvisor:
                     f"Apply {penalty.action} for {city}: "
                     f"edge penalty +{penalty.edge_penalty_cents:.0f}¢ "
                     f"(classification: {penalty.classification}, "
-                    f"win_rate={penalty.win_rate:.0%}, total_pnl=${penalty.total_pnl:+.2f})"
+                    f"win_rate={penalty.win_rate:.0%} excl. scratches, "
+                    f"total_pnl=${penalty.total_pnl:+.2f})"
                 ),
                 expected_impact=f"Reduce losses from {city} by requiring larger edge",
                 risk_of_change=f"Misses real edges in {city} if classification is wrong",
@@ -419,7 +523,7 @@ class StructuredAdvisor:
                     change_id=change_id,
                     monitor_window_days=14,
                     affected_cities=[city],
-                    baseline_win_rate=(sum(1 for p in pnls if p > 0) / len(pnls)),
+                    baseline_win_rate=baseline_wr,
                     baseline_avg_pnl=(sum(pnls) / len(pnls)),
                 ),
             )
@@ -534,6 +638,8 @@ class StructuredAdvisor:
 
     def _analyze_market_type_performance(self) -> list[AdvisorRecommendation]:
         """Flags market types with persistent underperformance."""
+        safeguard = self._get_safeguard_context()
+
         type_pnl: dict[str, list[float]] = {}
         for pos in self._all_closed_positions():
             mtype = pos.get("market_type", "")
@@ -545,13 +651,48 @@ class StructuredAdvisor:
             n = len(pnls)
             if n < MIN_SAMPLES_CONSIDER:
                 continue
-            win_rate = sum(1 for p in pnls if p > 0) / n
+
+            # Scratch-excluded win rate
+            scratch_count = sum(1 for p in pnls if abs(p) <= SCRATCH_PNL_THRESHOLD)
+            decided = n - scratch_count
+            win_rate = (
+                sum(1 for p in pnls if p > SCRATCH_PNL_THRESHOLD) / decided
+                if decided > 0 else 0.0
+            )
             total = sum(pnls)
             if win_rate >= 0.45 or total >= 0:
                 continue  # not underperforming
 
-            consistency = sum(1 for p in pnls if p < 0) / n
-            evidence = compute_evidence_strength(n, consistency)
+            # ── Safeguard ─────────────────────────────────────────────────────
+            if safeguard["safeguard_active"]:
+                recs.append(AdvisorRecommendation(
+                    id=f"market_type_{mtype}_{n}t",
+                    title=f"Market type signal (safeguarded): {mtype}",
+                    category="market_type_performance",
+                    change_type="filter_change",
+                    severity="P3",
+                    confidence=0.15,
+                    evidence_strength="anecdotal",
+                    sample_size=n,
+                    affected_market_types=[mtype],
+                    likely_root_cause=f"{mtype} underperforming but safeguard active",
+                    recommended_action="collect_more_data",
+                    auto_apply_allowed=False,
+                    manual_review_required=True,
+                    rollback_risk="medium",
+                    proposed_change_summary=(
+                        f"[SAFEGUARDED] {mtype} shows underperformance signal but "
+                        f"evidence is too thin. {safeguard['note']}"
+                    ),
+                    expected_impact="N/A — safeguard active",
+                    risk_of_change="Premature change could restrict valid market types",
+                    adaptation_maturity=MATURITY_OBSERVE_ONLY,
+                ))
+                continue
+
+            loss_rate = (sum(1 for p in pnls if p < -SCRATCH_PNL_THRESHOLD) / decided
+                         if decided > 0 else 0.0)
+            evidence = compute_evidence_strength(n, loss_rate)
             change_id = f"market_type_{mtype}_{n}t"
             sev, action, safe = classify_finding_severity(
                 "filter_change", evidence, n,
@@ -564,12 +705,13 @@ class StructuredAdvisor:
                 category="market_type_performance",
                 change_type="filter_change",
                 severity=sev,
-                confidence=round(consistency, 3),
+                confidence=round(loss_rate, 3),
                 evidence_strength=evidence,
                 sample_size=n,
                 affected_market_types=[mtype],
                 likely_root_cause=(
-                    f"{mtype} win_rate={win_rate:.0%} total_pnl=${total:+.2f} over {n} trades"
+                    f"{mtype} win_rate={win_rate:.0%} (excl. scratches) "
+                    f"total_pnl=${total:+.2f} over {n} trades"
                 ),
                 recommended_action=action,
                 auto_apply_allowed=False,

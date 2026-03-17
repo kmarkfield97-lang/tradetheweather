@@ -75,6 +75,22 @@ STATE_NEAR_LOCKED = "near_locked"
 STATE_LIVE = "live"
 STATE_BROKEN = "broken"
 
+# ─── Exit reason constants ────────────────────────────────────────────────────
+# Use these constants everywhere an exit reason is recorded so the classifier
+# and history module can match against stable strings without substring hacks.
+EXIT_THESIS_INVALIDATION = "thesis_invalidation"
+EXIT_FAIR_VALUE          = "fair_value"
+EXIT_TRAILING_STOP       = "trailing_stop"
+EXIT_STAGED_PROFIT       = "staged_profit"
+EXIT_SALVAGE             = "salvage"
+EXIT_DAILY_HALT          = "daily_halt"
+EXIT_EXPIRED             = "expired"
+
+# ─── Fragile-trade price threshold ───────────────────────────────────────────
+FRAGILE_LOW_PRICE_CENTS   = 20   # entries below this are flagged "low_price_entry"
+FRAGILE_SAME_DAY_HOURS    = 6    # entries with <6h left flagged "same_day_entry"
+FRAGILE_FINAL_HOURS_HOURS = 3    # entries with <3h left flagged "final_hours_entry"
+
 # ─── Correlated exposure caps ─────────────────────────────────────────────────
 # Fractions of starting_balance; enforced per city
 CITY_TEMP_EXPOSURE_PCT = 0.15       # max 15% in temp markets for one city
@@ -390,11 +406,29 @@ class Position:
     pnl_dollars: float = 0.0
     exit_price: Optional[int] = None
     placed_at: str = ""
-    high_water_mark: Optional[int] = None   # peak mark-to-market price (cents)
+    high_water_mark: Optional[int] = None   # peak mark-to-market price seen (MFE proxy, cents)
+    low_water_mark: Optional[int] = None    # worst mark-to-market price seen (MAE proxy, cents)
     trimmed_contracts: int = 0              # contracts already exited via staged trim
     city: str = ""                          # city key (e.g. "NYC", "DENVER")
     market_type: str = ""                   # "temp_high" / "temp_low" / "rain" / "snow"
     model_uncertainty: float = 0.3          # from signal aggregation at entry time (0–1)
+    exit_reason: str = ""                   # stable exit reason category (EXIT_* constant)
+    # ── Entry-time decision snapshot ─────────────────────────────────────────
+    # Populated once at trade execution from the TradeRecommendation.entry_context.
+    # Never mutated after entry. Used by post-trade diagnostics.
+    entry_our_prob: Optional[float] = None         # final adjusted probability
+    entry_base_prob: Optional[float] = None        # base prob before signal adjustment
+    entry_signal_adj: Optional[float] = None       # clamped signal adjustment applied
+    entry_edge: Optional[float] = None             # edge at decision time (0–1)
+    entry_sigma: Optional[float] = None            # dynamic sigma (°F) at entry
+    entry_hours_left: Optional[float] = None       # hours to settlement at entry
+    entry_spread: Optional[int] = None             # bid-ask spread in cents at entry
+    entry_regime: str = ""                         # cap_regime from signal aggregator
+    entry_signal_breakdown: list = field(default_factory=list)  # per-signal list
+    entry_weights_version: str = ""                # signal_weights.json version tag
+    entry_liquidity_dollars: Optional[float] = None  # executable liquidity at entry
+    # ── Fragile-trade flags ───────────────────────────────────────────────────
+    fragile_flags: list = field(default_factory=list)  # e.g. ["low_price_entry"]
 
 
 @dataclass
@@ -680,10 +714,10 @@ class PnLTracker:
 
     # ── Per-position exit evaluation ──────────────────────────────────────────
 
-    def check_profit_takes(self) -> list[tuple["Position", int, int]]:
+    def check_profit_takes(self) -> list[tuple["Position", int, int, str]]:
         """
         Evaluates all open positions for exit conditions.
-        Returns list of (position, exit_price_cents, contracts_to_exit).
+        Returns list of (position, exit_price_cents, contracts_to_exit, exit_reason).
 
         Exit decision framework (in priority order):
         1. Thesis invalidation (broken state)
@@ -733,9 +767,15 @@ class PnLTracker:
                 except Exception:
                     pass
 
-            # ── Update high_water_mark ────────────────────────────────────────
+            # ── Update high_water_mark (MFE) and low_water_mark (MAE) ─────────
+            changed = False
             if pos.high_water_mark is None or mark > pos.high_water_mark:
                 pos.high_water_mark = mark
+                changed = True
+            if pos.low_water_mark is None or mark < pos.low_water_mark:
+                pos.low_water_mark = mark
+                changed = True
+            if changed:
                 self._save()
 
             hwm = pos.high_water_mark if pos.high_water_mark is not None else pos.entry_price
@@ -766,17 +806,17 @@ class PnLTracker:
             )
 
             exit_contracts = 0
-            exit_reason = None
+            exit_reason = ""
 
             # ── Priority 1: Thesis invalidation (broken) ──────────────────────
             if state == STATE_BROKEN:
                 exit_contracts = remaining
-                exit_reason = "thesis_invalidated"
+                exit_reason = EXIT_THESIS_INVALIDATION
 
             # ── Priority 2: Daily brake medium → reduce non-locked ────────────
             elif self.state.daily_brake_level >= 2 and state not in (STATE_LOCKED, STATE_NEAR_LOCKED):
                 exit_contracts = remaining
-                exit_reason = "daily_brake_medium"
+                exit_reason = EXIT_DAILY_HALT
 
             # ── Priority 3: Staged profit-taking ─────────────────────────────
             elif mark >= PROFIT_TAKE_BANDS[0][0]:  # at or above lowest band (70¢)
@@ -794,26 +834,26 @@ class PnLTracker:
                     already_trimmed_frac = pos.trimmed_contracts / max(pos.contracts, 1)
                     if trim_frac > already_trimmed_frac + 0.05:
                         exit_contracts = trim_count
-                        exit_reason = f"staged_profit_{mark}¢"
+                        exit_reason = EXIT_STAGED_PROFIT
 
             # ── Priority 4: Progressive trailing stop ─────────────────────────
             if exit_contracts == 0 and hwm >= pos.entry_price * (1 + TRAILING_STOP_ARM_PCT):
                 floor = _trailing_stop_floor(hwm)
                 if floor is not None and mark < floor:
                     exit_contracts = remaining
-                    exit_reason = f"trailing_stop(peak={hwm}¢,floor={floor}¢)"
+                    exit_reason = EXIT_TRAILING_STOP
 
             # ── Priority 5: Fair-value exit ───────────────────────────────────
             if exit_contracts == 0 and exit_ev_adj >= hold_ev and state not in (STATE_LOCKED,):
                 exit_contracts = remaining
-                exit_reason = f"fair_value(exit_ev={exit_ev_adj:.1f}>hold_ev={hold_ev:.1f})"
+                exit_reason = EXIT_FAIR_VALUE
 
             # ── Priority 6: Salvage stop (fail-safe) ─────────────────────────
             if exit_contracts == 0:
                 salvage_price = round(pos.entry_price * SALVAGE_STOP_PCT)
                 if mark < salvage_price:
                     exit_contracts = remaining
-                    exit_reason = f"salvage_stop(mark={mark}¢<{salvage_price}¢)"
+                    exit_reason = EXIT_SALVAGE
 
             if exit_contracts > 0 and exit_reason:
                 # Clamp to remaining
@@ -822,7 +862,7 @@ class PnLTracker:
                     f"EXIT DECISION: {pos.ticker} {pos.side.upper()} "
                     f"exit {exit_contracts}/{pos.contracts} @ {mark}¢ | reason={exit_reason}"
                 )
-                exits.append((pos, mark, exit_contracts))
+                exits.append((pos, mark, exit_contracts, exit_reason))
 
         return exits
 
@@ -842,7 +882,30 @@ class PnLTracker:
     def record_trade(self, ticker: str, order_id: str, side: str,
                      contracts: int, entry_price: int, cost_dollars: float,
                      city: str = "", market_type: str = "",
-                     model_uncertainty: float = 0.3):
+                     model_uncertainty: float = 0.3,
+                     entry_context: Optional[dict] = None):
+        """
+        Records a new trade entry. entry_context is the dict attached to
+        TradeRecommendation containing the full decision snapshot (probabilities,
+        signal breakdown, sigma, spread, regime, etc.).
+        """
+        ctx = entry_context or {}
+
+        # ── Fragile-trade flag computation ────────────────────────────────────
+        fragile_flags: list[str] = []
+        hours_left = ctx.get("hours_left")
+        if entry_price > 0 and entry_price < FRAGILE_LOW_PRICE_CENTS:
+            fragile_flags.append("low_price_entry")
+        if hours_left is not None:
+            if hours_left < FRAGILE_FINAL_HOURS_HOURS:
+                fragile_flags.append("final_hours_entry")
+            elif hours_left < FRAGILE_SAME_DAY_HOURS:
+                fragile_flags.append("same_day_entry")
+        if ctx.get("extreme_disagreement"):
+            fragile_flags.append("model_market_disagreement")
+        if ctx.get("model_uncertainty", model_uncertainty) > 0.6:
+            fragile_flags.append("high_model_uncertainty")
+
         pos = Position(
             ticker=ticker,
             order_id=order_id,
@@ -855,16 +918,31 @@ class PnLTracker:
             city=city,
             market_type=market_type,
             model_uncertainty=model_uncertainty,
+            # ── Entry snapshot ────────────────────────────────────────────────
+            entry_our_prob=ctx.get("our_prob"),
+            entry_base_prob=ctx.get("base_prob"),
+            entry_signal_adj=ctx.get("signal_adj"),
+            entry_edge=ctx.get("edge"),
+            entry_sigma=ctx.get("sigma_f"),
+            entry_hours_left=hours_left,
+            entry_spread=ctx.get("spread"),
+            entry_regime=ctx.get("cap_regime", ""),
+            entry_signal_breakdown=ctx.get("signal_breakdown", []),
+            entry_weights_version=ctx.get("weights_version", ""),
+            entry_liquidity_dollars=ctx.get("exec_liq"),
+            fragile_flags=fragile_flags,
         )
         self.state.positions.append(pos)
         self.state.trades_placed += 1
         self._save()
 
     def record_exit(self, order_id: str, exit_price: int, pnl_dollars: float,
-                    contracts_exited: Optional[int] = None):
+                    contracts_exited: Optional[int] = None,
+                    exit_reason: str = ""):
         """
         Records an exit. If contracts_exited < pos.contracts, records a partial exit
         by updating trimmed_contracts. Full exit sets status to 'closed'.
+        exit_reason should be one of the EXIT_* constants defined above.
         """
         for pos in self.state.positions:
             if pos.order_id == order_id and pos.status == "open":
@@ -873,6 +951,8 @@ class PnLTracker:
                 pos.trimmed_contracts = min(total, pos.trimmed_contracts + exited)
                 pos.pnl_dollars += pnl_dollars
                 pos.exit_price = exit_price
+                if exit_reason:
+                    pos.exit_reason = exit_reason
                 self.state.realized_pnl += pnl_dollars
                 if pos.trimmed_contracts >= total:
                     pos.status = "closed"
@@ -930,7 +1010,8 @@ class PnLTracker:
                 else:
                     pnl = (pos.entry_price / 100 - exit_price / 100) * remaining
 
-                self.record_exit(pos.order_id, exit_price, pnl, remaining)
+                self.record_exit(pos.order_id, exit_price, pnl, remaining,
+                                 exit_reason=EXIT_DAILY_HALT)
                 exited.append(pos.ticker)
                 logger.info(f"Stop loss exit: {pos.ticker} {pos.side.upper()} {remaining}x @ {exit_price}¢ pnl=${pnl:+.2f}")
 
