@@ -498,7 +498,8 @@ def derive_structured_lesson(position: dict) -> StructuredLesson:
     elif exit_reason_cat == "fair_value":
         tags.exit_quality = "neutral"
     elif exit_reason_cat == "stalled_capital_trap":
-        tags.exit_quality = "poor"   # position stagnated — capital was poorly deployed
+        tags.exit_quality = "poor"              # position stagnated — capital was poorly deployed
+        tags.should_have_exited_earlier = True  # stall exit = held too long with no catalyst
 
     # MAE signal: if position immediately went against us (low_water_mark < entry),
     # that's evidence of a model or timing issue.
@@ -639,6 +640,7 @@ _LESSON_EXIT_PREFIXES = [
     ("salvage_stop",     "salvage"),
     ("daily_brake",      "daily_halt"),
     ("daily_halt",       "daily_halt"),
+    ("stalled_capital",  "stalled_capital_trap"),   # EXIT_STALLED = "stalled_capital_trap"
     ("expired",          "expired"),
 ]
 

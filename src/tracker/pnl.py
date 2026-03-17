@@ -1305,7 +1305,8 @@ class PnLTracker:
             # (e.g. 44¢) simply means the market hasn't moved yet — not a trap.
             if (hours_left is None or hours_left < STALL_HOLD_EV_HOURS_THRESHOLD) and \
                     hold_ev < STALL_HOLD_EV_CEILING:
-                stall_flags.append(f"weak_hold_ev({hold_ev:.1f}¢,{hours_left:.1f}h_left)")
+                _hrs_str = f"{hours_left:.1f}" if hours_left is not None else "N/A"
+                stall_flags.append(f"weak_hold_ev({hold_ev:.1f}¢,{_hrs_str}h_left)")
 
             if exit_ev < STALL_EXIT_EV_CEILING:
                 stall_flags.append(f"weak_exit_ev({exit_ev:.1f}¢)")
