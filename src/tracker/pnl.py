@@ -530,11 +530,14 @@ class PnLTracker:
 
         pnl_pct = (current - starting) / starting
 
-        # Daily profit target
-        if pnl_pct >= PROFIT_TARGET_PCT and not self.state.goal_met:
+        # Daily profit target — use realized_pnl only to avoid false triggers from
+        # Kalshi balance timing (available balance can lag behind order placement,
+        # causing _portfolio_value to double-count open position cost).
+        realized_pnl_pct = self.state.realized_pnl / starting if starting > 0 else 0
+        if realized_pnl_pct >= PROFIT_TARGET_PCT and not self.state.goal_met:
             self.state.goal_met = True
             self.state.trading_halted = True
-            self.state.halt_reason = f"Daily profit target reached (+{pnl_pct * 100:.1f}%)"
+            self.state.halt_reason = f"Daily profit target reached (+{realized_pnl_pct * 100:.1f}%)"
             return
 
         if self.state.trading_halted:
