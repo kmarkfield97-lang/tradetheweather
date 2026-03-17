@@ -165,7 +165,13 @@ class TradeTheWeatherBot:
             from src.tracker.pnl import MAX_TRADES
 
             starting = daily_state.starting_balance
-            ending = daily_state.current_balance
+            # Include open position cost basis so balance reflects total portfolio value
+            open_position_cost = sum(
+                (p.get("cost_dollars", 0.0) if isinstance(p, dict) else p.cost_dollars)
+                for p in daily_state.positions
+                if (p.get("status") if isinstance(p, dict) else p.status) == "open"
+            )
+            ending = daily_state.current_balance + open_position_cost
             pnl = ending - starting
             pnl_pct = (pnl / starting * 100) if starting > 0 else 0.0
 

@@ -472,7 +472,11 @@ class DailyHistoryTracker:
         insights.performance_by_type = perf_type
         insights.open_p0_count = p0_total
 
-        if perf_city:
+        known_cities = {c for c in perf_city if c and c != "UNKNOWN"}
+        if known_cities:
+            insights.best_city = max(known_cities, key=lambda c: perf_city[c]["total_pnl"])
+            insights.worst_city = min(known_cities, key=lambda c: perf_city[c]["total_pnl"])
+        elif perf_city:
             insights.best_city = max(perf_city, key=lambda c: perf_city[c]["total_pnl"])
             insights.worst_city = min(perf_city, key=lambda c: perf_city[c]["total_pnl"])
 
