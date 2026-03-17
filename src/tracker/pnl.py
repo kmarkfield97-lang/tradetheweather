@@ -65,6 +65,17 @@ SLIPPAGE_CENTS = 2              # estimated slippage cost in cents per contract
 FEE_CENTS = 0                   # Kalshi fees (currently 0 for makers)
 FINAL_HOUR_CONSERVATISM = 1.20  # multiply exit attractiveness by this in last hour
 
+# ─── Fair-value exit grace period ────────────────────────────────────────────
+# After entering a position, suppress the fair-value exit for this many minutes.
+# Rationale: hold_ev is anchored to the current market price and discounts it
+# by a risk buffer.  On a freshly entered position the market price IS our
+# entry price, so hold_ev < entry_price by construction, which makes exit_ev
+# appear attractive even though we just took the trade because our estimated
+# probability is higher than the market's.  The grace period gives the market
+# time to reprice toward our estimate before allowing a fair-value-only exit.
+# Emergency exits (thesis invalidation, trailing stop, salvage) are NOT gated.
+FAIR_VALUE_GRACE_MINUTES = 30
+
 # ─── Thesis invalidation sensitivity ─────────────────────────────────────────
 THESIS_TEMP_DIVERGENCE_F = 4.0  # °F: if current obs diverges this much, invalidate
 THESIS_TREND_REVERSAL_F_PER_HR = -1.5  # °F/hr: sustained cooling triggers invalidation
@@ -847,9 +858,30 @@ class PnLTracker:
                     exit_reason = EXIT_TRAILING_STOP
 
             # ── Priority 5: Fair-value exit ───────────────────────────────────
+            # Suppress for FAIR_VALUE_GRACE_MINUTES after entry: hold_ev is
+            # anchored to the current market price and discounts it by a risk
+            # buffer, so on a fresh position exit_ev trivially exceeds hold_ev
+            # even though we entered because our estimated prob is higher than
+            # the market's.  Emergency exits (1–4 and 6) are NOT gated.
+            _fv_grace_ok = True
             if exit_contracts == 0 and exit_ev_adj >= hold_ev and state not in (STATE_LOCKED,):
-                exit_contracts = remaining
-                exit_reason = EXIT_FAIR_VALUE
+                if pos.placed_at:
+                    try:
+                        placed_dt = datetime.fromisoformat(pos.placed_at.replace("Z", "+00:00"))
+                        age_minutes = (datetime.now(timezone.utc) - placed_dt).total_seconds() / 60
+                        if age_minutes < FAIR_VALUE_GRACE_MINUTES:
+                            _fv_grace_ok = False
+                            logger.info(
+                                f"FV_GRACE {pos.ticker}: suppressing fair-value exit — "
+                                f"position is only {age_minutes:.0f}min old "
+                                f"(grace={FAIR_VALUE_GRACE_MINUTES}min) "
+                                f"exit_ev={exit_ev_adj:.1f}¢ hold_ev={hold_ev:.1f}¢"
+                            )
+                    except Exception:
+                        pass  # parse failure → allow exit (safe default)
+                if _fv_grace_ok:
+                    exit_contracts = remaining
+                    exit_reason = EXIT_FAIR_VALUE
 
             # ── Priority 6: Salvage stop (fail-safe) ─────────────────────────
             if exit_contracts == 0:

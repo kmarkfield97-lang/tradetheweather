@@ -53,6 +53,30 @@ EXTREME_DISAGREEMENT_EDGE = 0.15   # if market_implied says extreme disagreement
 MAX_POSITION_PCT = 0.10     # 10% of daily budget per trade
 MAX_DOLLARS_PER_TRADE = 5.0 # hard cap: never risk more than $5 on one trade
 
+# ── Trim-band entry guard ──────────────────────────────────────────────────────
+# Fresh entries at prices already inside a sell trim band generate little
+# monetizable edge because sell logic fires almost immediately.
+#
+# For each band (min¢, max¢, trim_frac):
+#   upside_before_trim  = band_min - entry_price  (0 if already inside band)
+#   trim_drag_cents     = trim_frac * (entry_price - spread/2)  (approximate cost
+#                         of selling trim_frac of the position back near entry)
+#   tradable_edge_cents = raw_edge_cents - SLIPPAGE_TOTAL_CENTS - trim_drag_cents
+#
+# Extra edge hurdles required to allow fresh entry inside or near a trim band.
+# These are *additional* cents above the normal min_edge_req.
+TRIM_BAND_EXTRA_EDGE_70_79 = 0.07   # 7¢ extra: band 70–79¢ (25% trim fires quickly)
+TRIM_BAND_EXTRA_EDGE_80_89 = 0.12   # 12¢ extra: band 80–89¢ (40% trim, rare situations)
+TRIM_BAND_EXTRA_EDGE_90_PLUS = 9.99 # effectively reject: 90¢+ band (65–85% trim)
+
+# "Near-band" warning zone: flag entries within this many cents below a trim band.
+# These won't be rejected outright but will be logged with a warning.
+TRIM_BAND_NEAR_WARN_CENTS = 5
+
+# Total round-trip slippage estimate used in tradable-edge calculation (cents).
+# Entry slippage + exit slippage (both half-spread, rounded up).
+TRIM_BAND_SLIPPAGE_TOTAL = 4  # cents
+
 # ── Default forecast uncertainty fallback ─────────────────────────────────────
 DEFAULT_UNCERTAINTY_F = 7.0
 
@@ -774,6 +798,56 @@ class TradeAnalysisEngine:
             )
             return None
 
+        # ── Confidence tier (computed early for trim-band guard) ──────────────
+        # Round-number thresholds get one tier lower (threshold_cluster_confidence
+        # was computed above during signal aggregation).
+        if edge >= 0.15:
+            confidence = "high" if threshold_cluster_confidence >= 0.5 else "medium"
+        elif edge >= 0.10:
+            confidence = "medium" if threshold_cluster_confidence >= 0.3 else "low"
+        else:
+            confidence = "low"
+
+        # ── Trim-band entry guard ──────────────────────────────────────────────
+        # A fresh position opened inside a staged profit-taking band will be
+        # immediately subject to a trim, making the monetizable edge much smaller
+        # than the raw edge figure. Reject or warn depending on which band we're in.
+        _spread_for_guard = int(spread) if spread else 5  # fallback 5¢ if unavailable
+        _tb_allow, _tb_zone, _tb_info = self._trim_band_entry_check(
+            ticker=ticker,
+            price=price,
+            edge=edge,
+            min_edge_req=min_edge_req,
+            confidence=confidence,
+            spread=_spread_for_guard,
+        )
+        if _tb_zone != "clear":
+            if not _tb_allow:
+                logger.info(
+                    f"TRIM_BAND_REJECT {ticker}: {_tb_info['reason_detail']} | "
+                    f"upside_before_trim={_tb_info['upside_before_trim_cents']}¢ "
+                    f"tradable_edge={_tb_info['tradable_edge_cents']:.1f}¢"
+                )
+                self._record_missed_opportunity(
+                    ticker=ticker, city=city, market_type=market_type,
+                    rejection_reason=f"trim_band_reject_{_tb_zone}",
+                    our_prob=our_prob, market_price_cents=price,
+                    edge_cents=edge * 100,
+                )
+                return None
+            elif _tb_zone == "near_trim_band":
+                logger.warning(
+                    f"TRIM_BAND_WARN {ticker}: {_tb_info['reason_detail']} | "
+                    f"upside_before_trim={_tb_info['upside_before_trim_cents']}¢ "
+                    f"tradable_edge={_tb_info['tradable_edge_cents']:.1f}¢"
+                )
+            else:
+                logger.info(
+                    f"TRIM_BAND_ACCEPT {ticker}: {_tb_info['reason_detail']} | "
+                    f"upside_before_trim={_tb_info['upside_before_trim_cents']}¢ "
+                    f"tradable_edge={_tb_info['tradable_edge_cents']:.1f}¢"
+                )
+
         # ── Position sizing via position_sizer module ─────────────────────────
         sizing: Optional[dict] = None
         try:
@@ -818,15 +892,6 @@ class TradeAnalysisEngine:
             actual_cost = contracts * (price / 100)
         if contracts < 1:
             return None
-
-        # ── Confidence tier ────────────────────────────────────────────────────
-        # Round-number thresholds get one tier lower
-        if edge >= 0.15:
-            confidence = "high" if threshold_cluster_confidence >= 0.5 else "medium"
-        elif edge >= 0.10:
-            confidence = "medium" if threshold_cluster_confidence >= 0.3 else "low"
-        else:
-            confidence = "low"
 
         alerts = [a["event"] for a in report.get("alerts", [])]
 
@@ -908,6 +973,8 @@ class TradeAnalysisEngine:
             "exec_liq":            round(exec_liq, 2),
             "weights_version":     agg.weights_version,
             "signal_breakdown":    signal_breakdown,
+            "trim_band_zone":      _tb_zone,
+            "tradable_edge_cents": _tb_info["tradable_edge_cents"],
         }
 
         return TradeRecommendation(
@@ -931,6 +998,151 @@ class TradeAnalysisEngine:
             weights_version=agg.weights_version,
             entry_context=entry_ctx,
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Trim-band entry guard
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _trim_band_entry_check(
+        ticker: str,
+        price: int,
+        edge: float,
+        min_edge_req: float,
+        confidence: str,
+        spread: int,
+    ) -> tuple[bool, str, dict]:
+        """
+        Evaluates whether a *fresh* entry at `price` is economically sound given
+        the sell logic's staged profit-taking bands.
+
+        Sell logic trims positions at:
+          70–79¢: 25 %   80–89¢: 40 %   90–95¢: 65 %   96–99¢: 85 %
+
+        A brand-new position opened inside one of those bands will be immediately
+        subject to a trim — the monetizable upside is much smaller than the raw
+        edge suggests.
+
+        Returns:
+          (allow: bool, reason: str, info: dict)
+
+        `info` contains all fields required for the structured log entry:
+          - price, edge_cents, tradable_edge_cents, upside_before_trim_cents,
+            trim_band, trim_fraction, zone, reason_detail
+        """
+        from src.tracker.pnl import PROFIT_TAKE_BANDS  # avoid circular import at module level
+
+        edge_cents = round(edge * 100, 2)
+        slippage = TRIM_BAND_SLIPPAGE_TOTAL
+
+        # Determine which band (if any) the entry price falls into, or is near.
+        in_band: Optional[tuple] = None
+        near_band: Optional[tuple] = None
+        for band in PROFIT_TAKE_BANDS:
+            band_min, band_max, trim_frac = band
+            if band_min <= price <= band_max:
+                in_band = band
+                break
+            # "near" = within TRIM_BAND_NEAR_WARN_CENTS below the band
+            if band_min - TRIM_BAND_NEAR_WARN_CENTS <= price < band_min:
+                near_band = band
+                # Don't break — a higher band might actually contain the price
+
+        if in_band is None and near_band is None:
+            # Well below all trim bands — no coordination issue
+            info = {
+                "ticker": ticker,
+                "price": price,
+                "edge_cents": edge_cents,
+                "tradable_edge_cents": edge_cents,
+                "upside_before_trim_cents": PROFIT_TAKE_BANDS[0][0] - price,
+                "trim_band": None,
+                "trim_fraction": 0.0,
+                "zone": "clear",
+                "reason_detail": "price below all trim bands",
+            }
+            return True, "clear", info
+
+        # ── Inside a trim band ────────────────────────────────────────────────
+        if in_band is not None:
+            band_min, band_max, trim_frac = in_band
+
+            # Upside before the trim fires = 0 (already inside the band).
+            # After trimming trim_frac of contracts the remaining position can
+            # run to 100¢; the drag is the profit left on the trimmed fraction.
+            # Conservative estimate: trimmed contracts are sold back at roughly
+            # entry_price (worst case: sell logic fires at the band floor).
+            # That means we lose ~trim_frac * spread/2 from entry on those
+            # contracts, plus slippage on the full round trip.
+            trim_drag = trim_frac * (spread / 2.0)
+            tradable_edge_cents = round(edge_cents - slippage - trim_drag, 2)
+
+            # Determine the extra edge hurdle for this band
+            if band_min >= 90:
+                extra_hurdle = TRIM_BAND_EXTRA_EDGE_90_PLUS * 100  # convert to cents
+                zone = "trim_90_plus"
+            elif band_min >= 80:
+                extra_hurdle = TRIM_BAND_EXTRA_EDGE_80_89 * 100
+                zone = "trim_80_89"
+            else:
+                extra_hurdle = TRIM_BAND_EXTRA_EDGE_70_79 * 100
+                zone = "trim_70_79"
+
+            required_edge_cents = round((min_edge_req * 100) + extra_hurdle, 2)
+            allow = (
+                edge_cents >= required_edge_cents
+                and confidence == "high"  # band entries require high confidence
+            )
+
+            reason_detail = (
+                f"entry_price={price}¢ inside trim band [{band_min}–{band_max}¢] "
+                f"(trim_frac={trim_frac:.0%}); "
+                f"edge={edge_cents:.1f}¢ tradable={tradable_edge_cents:.1f}¢ "
+                f"required={required_edge_cents:.1f}¢ confidence={confidence}; "
+                f"{'ACCEPTED' if allow else 'REJECTED'}"
+            )
+            info = {
+                "ticker": ticker,
+                "price": price,
+                "edge_cents": edge_cents,
+                "tradable_edge_cents": tradable_edge_cents,
+                "upside_before_trim_cents": 0,
+                "trim_band": f"{band_min}-{band_max}",
+                "trim_fraction": trim_frac,
+                "zone": zone,
+                "required_edge_cents": required_edge_cents,
+                "reason_detail": reason_detail,
+            }
+            return allow, zone, info
+
+        # ── Near a trim band (within TRIM_BAND_NEAR_WARN_CENTS below it) ─────
+        band_min, band_max, trim_frac = near_band  # type: ignore[misc]
+        upside_before_trim = band_min - price  # positive: 1–5¢ headroom
+
+        # Tradable edge = raw edge - slippage. No trim drag yet (trim hasn't
+        # fired), but upside before trim is slim so log as a warning.
+        tradable_edge_cents = round(edge_cents - slippage, 2)
+
+        zone = "near_trim_band"
+        reason_detail = (
+            f"entry_price={price}¢ within {TRIM_BAND_NEAR_WARN_CENTS}¢ of "
+            f"trim band [{band_min}–{band_max}¢] (trim_frac={trim_frac:.0%}); "
+            f"upside_before_trim={upside_before_trim}¢ "
+            f"edge={edge_cents:.1f}¢ tradable={tradable_edge_cents:.1f}¢; WARN_ALLOWED"
+        )
+        info = {
+            "ticker": ticker,
+            "price": price,
+            "edge_cents": edge_cents,
+            "tradable_edge_cents": tradable_edge_cents,
+            "upside_before_trim_cents": upside_before_trim,
+            "trim_band": f"{band_min}-{band_max}",
+            "trim_fraction": trim_frac,
+            "zone": zone,
+            "reason_detail": reason_detail,
+        }
+        # Allow near-band entries but emit a warning for post-trade review
+        return True, zone, info
 
     # ─────────────────────────────────────────────────────────────────────────
     # Contextual signal adjustment cap
