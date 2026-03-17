@@ -497,6 +497,8 @@ def derive_structured_lesson(position: dict) -> StructuredLesson:
         tags.halt_side_effects = True
     elif exit_reason_cat == "fair_value":
         tags.exit_quality = "neutral"
+    elif exit_reason_cat == "stalled_capital_trap":
+        tags.exit_quality = "poor"   # position stagnated — capital was poorly deployed
 
     # MAE signal: if position immediately went against us (low_water_mark < entry),
     # that's evidence of a model or timing issue.

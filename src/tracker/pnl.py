@@ -112,12 +112,19 @@ STATE_STALLED = "stalled"          # capital trap: poor EV, poor liquidity, no c
 
 # ─── Capital trap / stalled position thresholds ───────────────────────────────
 STALL_MIN_AGE_MINUTES = 45          # position must be at least this old to be flagged
-STALL_HOLD_EV_CEILING = 45.0        # hold EV below this (¢) raises concern
+STALL_HOLD_EV_CEILING = 45.0        # hold EV below this (¢) raises concern when <2h left
 STALL_EXIT_EV_CEILING = 40.0        # exit EV below this (¢) raises concern
 STALL_SPREAD_WIDE_CENTS = 10        # spread at or above this is "wide"
 STALL_POOR_LIQUIDITY_DOLLARS = 2.0  # total book depth below this is "poor"
 STALL_MFE_REQUIRED_CENTS = 3        # if HWM never exceeded entry+this, no favorable excursion
-STALL_SCORE_THRESHOLD = 3           # flags needed (out of 6) to be classified stalled
+STALL_SCORE_THRESHOLD = 3           # flags needed (out of 7) to be classified stalled
+# Time-aware hold EV ceiling: with >2h left the market is still live; only apply
+# the EV ceiling when time is short enough that the mark is likely anchored.
+STALL_HOLD_EV_HOURS_THRESHOLD = 2.0  # only penalise hold EV when <2h left
+# Minimum consecutive stall cycles before escalating from alert to forced action
+STALL_ESCALATION_CYCLES = 3          # flag 3× in a row before treating as urgent
+# Minimum stall cycles to re-alert on Telegram (suppress duplicate noise)
+STALL_ALERT_EVERY_N_CYCLES = 2       # alert on first detection, then every 2 cycles
 
 # ─── Exit reason constants ────────────────────────────────────────────────────
 # Use these constants everywhere an exit reason is recorded so the classifier
@@ -129,6 +136,7 @@ EXIT_STAGED_PROFIT       = "staged_profit"
 EXIT_SALVAGE             = "salvage"
 EXIT_DAILY_HALT          = "daily_halt"
 EXIT_EXPIRED             = "expired"
+EXIT_STALLED             = "stalled_capital_trap"  # position is a capital trap with no catalyst
 
 # ─── Fragile-trade price threshold ───────────────────────────────────────────
 FRAGILE_LOW_PRICE_CENTS   = 20   # entries below this are flagged "low_price_entry"
@@ -550,6 +558,7 @@ class DailyState:
     daily_brake_level: int = 0   # 0=none, 1=soft(-3%), 2=medium(-4%), 3=hard(-5%)
     goal_exception_trades: int = 0  # trades allowed past +5% goal (max 2/day)
     pending_buy_dollars: float = 0.0  # capital reserved by resting buy orders (updated by orchestrator)
+    stall_alert_counts: dict = field(default_factory=dict)  # ticker -> consecutive stall cycles seen
 
 
 # ─── PnLTracker ──────────────────────────────────────────────────────────────
@@ -1072,7 +1081,28 @@ class PnLTracker:
                     exit_contracts = remaining
                     exit_reason = EXIT_FAIR_VALUE
 
-            # ── Priority 6: Salvage stop (fail-safe) ─────────────────────────
+            # ── Priority 6: Capital-trap / stalled exit ────────────────────────
+            # Triggered when a position has been flagged as urgently stalled for
+            # >= STALL_ESCALATION_CYCLES consecutive balance-refresh cycles.
+            # Bypasses the fair-value grace period intentionally: a stalled position
+            # that has been stuck for many cycles with poor EV should be exited even
+            # if it is still young (entry price may already be above fair value).
+            # Only fires if there is a real exit price available (mark > 0 is already
+            # confirmed above) and the position has an exit EV above a minimal floor.
+            if exit_contracts == 0:
+                stall_cycles = self.state.stall_alert_counts.get(pos.ticker, 0)
+                if stall_cycles >= STALL_ESCALATION_CYCLES:
+                    _stall_exit_ev = mark - SLIPPAGE_CENTS - FEE_CENTS
+                    if _stall_exit_ev > 1:  # must recover at least something
+                        exit_contracts = remaining
+                        exit_reason = EXIT_STALLED
+                        logger.warning(
+                            f"STALL_EXIT_TRIGGER {pos.ticker} {pos.side.upper()} | "
+                            f"stall_cycles={stall_cycles} >= {STALL_ESCALATION_CYCLES} | "
+                            f"mark={mark}¢ exit_ev={_stall_exit_ev:.1f}¢ — forcing exit"
+                        )
+
+            # ── Priority 7: Salvage stop (fail-safe) ─────────────────────────
             if exit_contracts == 0:
                 salvage_price = round(pos.entry_price * SALVAGE_STOP_PCT)
                 if mark < salvage_price:
@@ -1097,10 +1127,17 @@ class PnLTracker:
         Estimate how realistically a position can be exited at a reasonable fill.
 
         Score is 0–100 (higher = more exitable).
-        Components:
-          - book_depth:   does the book have enough depth to absorb our size?
-          - spread_width: is the spread narrow enough for a fair fill?
-          - best_price:   is there a real bid/ask on our side?
+
+        Components (in order of penalty severity):
+          book_depth:      can the book absorb our remaining size?
+          spread_width:    is the spread narrow relative to price?
+          slippage_ratio:  does slippage consume an unreasonable fraction of exit value?
+
+        Slippage-ratio penalty replaces the old flat low-price penalty.
+        A 15¢ price with 2¢ slippage = 13% exit cost — very costly.
+        A 50¢ price with 2¢ slippage = 4% — manageable.
+        This is more meaningful than penalising low prices in absolute terms,
+        because high-price positions can also be illiquid.
 
         Returns a dict with score and component breakdown.
         """
@@ -1113,7 +1150,7 @@ class PnLTracker:
         score = 100
         flags = []
 
-        # No price at all — cannot exit
+        # No price at all — cannot exit regardless of other factors
         if not best_price or best_price <= 0:
             return {
                 "score": 0,
@@ -1124,30 +1161,47 @@ class PnLTracker:
                 "flags": ["no_best_price"],
             }
 
-        # Spread penalty: wide spread makes exit costly
-        if spread is not None:
-            if spread >= STALL_SPREAD_WIDE_CENTS:
-                score -= 30
-                flags.append(f"wide_spread({spread}¢)")
-            elif spread >= STALL_SPREAD_WIDE_CENTS // 2:
-                score -= 15
-                flags.append(f"moderate_spread({spread}¢)")
+        # Spread penalty: wide spread relative to best price is costly
+        # Use spread/best_price ratio so the penalty scales with how much of the
+        # exit value the spread consumes.
+        if spread is not None and spread > 0 and best_price > 0:
+            spread_ratio = spread / best_price
+            if spread_ratio >= 0.30:        # spread ≥30% of price — very wide
+                score -= 35
+                flags.append(f"very_wide_spread({spread}¢/{spread_ratio:.0%}_of_price)")
+            elif spread_ratio >= 0.15:      # spread 15–30% — wide
+                score -= 20
+                flags.append(f"wide_spread({spread}¢/{spread_ratio:.0%}_of_price)")
+            elif spread >= STALL_SPREAD_WIDE_CENTS:  # absolute floor
+                score -= 10
+                flags.append(f"wide_spread_abs({spread}¢)")
 
-        # Depth penalty: thin book may not absorb our full size
-        if total_volume < STALL_POOR_LIQUIDITY_DOLLARS:
+        # Depth penalty: thin book relative to our position size
+        # Scale penalty by how many contracts we need to unwind
+        position_dollars = (best_price / 100.0) * remaining
+        if total_volume <= 0:
+            score -= 40
+            flags.append("empty_book")
+        elif total_volume < STALL_POOR_LIQUIDITY_DOLLARS:
             score -= 35
             flags.append(f"poor_depth(${total_volume:.2f})")
+        elif total_volume < position_dollars * 0.5:
+            # Book depth less than half our position size — can't exit cleanly
+            score -= 20
+            flags.append(f"thin_depth_vs_size(${total_volume:.2f}<50%_of_${position_dollars:.2f})")
         elif total_volume < STALL_POOR_LIQUIDITY_DOLLARS * 3:
-            score -= 15
+            score -= 10
             flags.append(f"thin_depth(${total_volume:.2f})")
 
-        # Low best price means the exit value itself is minimal
-        if best_price <= 10:
+        # Slippage ratio penalty: how costly is the fixed slippage relative to the exit price?
+        # SLIPPAGE_CENTS=2¢; at 10¢ that's 20% cost, at 50¢ that's 4%, at 80¢ that's 2.5%
+        slippage_ratio = SLIPPAGE_CENTS / best_price if best_price > 0 else 1.0
+        if slippage_ratio >= 0.20:      # slippage ≥20% of exit value — effectively zero value
             score -= 20
-            flags.append(f"very_low_price({best_price}¢)")
-        elif best_price <= 20:
+            flags.append(f"high_slippage_ratio({slippage_ratio:.0%})")
+        elif slippage_ratio >= 0.10:    # slippage 10–20% — costly
             score -= 10
-            flags.append(f"low_price({best_price}¢)")
+            flags.append(f"elevated_slippage_ratio({slippage_ratio:.0%})")
 
         score = max(0, min(100, score))
         return {
@@ -1156,6 +1210,7 @@ class PnLTracker:
             "spread": spread,
             "total_volume": total_volume,
             "remaining_contracts": remaining,
+            "slippage_ratio": round(slippage_ratio, 3),
             "flags": flags,
         }
 
@@ -1163,21 +1218,26 @@ class PnLTracker:
 
     def classify_stalled_positions(self) -> list[dict]:
         """
-        Scans all open positions and flags any that appear to be capital traps:
-        poor hold EV, poor exit EV, poor liquidity, no favorable excursion, and
-        sufficient age that we can be confident the trade has stagnated.
+        Scans all open positions and flags any that appear to be capital traps.
 
-        Returns a list of report dicts — one per flagged position — containing:
-          ticker, side, age_minutes, mark, hold_ev, exit_ev, exitability_score,
-          spread, total_volume, stall_flags, action, state.
+        Design notes:
+          - Only LIVE positions are evaluated; BROKEN/LOCKED/NEAR_LOCKED are skipped
+            (BROKEN is handled by check_profit_takes; LOCKED/NEAR_LOCKED are working)
+          - Hold EV flag is only raised when <STALL_HOLD_EV_HOURS_THRESHOLD hours
+            remain, because with plenty of time the market is still live and a mid-range
+            hold EV is not a stall signal
+          - Consecutive stall counts are tracked in DailyState.stall_alert_counts to
+            allow deduplication, escalation, and repeat-count logging
+          - Positions cleared from stall (e.g. turned LOCKED) have their count reset
 
-        Does NOT execute any exits. Callers decide what to do with the reports.
+        Returns list of report dicts. Does NOT execute any exits.
         """
         if not self.kalshi:
             return []
 
         reports = []
         now_utc = datetime.now(timezone.utc)
+        tickers_stalled_this_cycle: set = set()
 
         for pos in self.state.positions:
             if pos.status != "open":
@@ -1198,7 +1258,7 @@ class PnLTracker:
             if age_minutes < STALL_MIN_AGE_MINUTES:
                 continue
 
-            # Get current market data
+            # Get current market data — skip position if liquidity unavailable
             try:
                 liquidity = self.kalshi.get_liquidity(pos.ticker)
             except Exception as e:
@@ -1206,8 +1266,10 @@ class PnLTracker:
                 continue
 
             mark = liquidity.get("best_yes_price" if pos.side == "yes" else "best_no_price")
+            # If no mark at all, we cannot classify state or compute EV — skip
             if not mark or mark <= 0:
-                mark = 0
+                logger.debug(f"STALL_CHECK: no mark for {pos.ticker} {pos.side} — skipping")
+                continue
 
             close_time_str = _get_close_time(pos.ticker, self.kalshi)
             hours_left = _hours_to_settlement(close_time_str)
@@ -1221,23 +1283,29 @@ class PnLTracker:
                 except Exception:
                     pass
 
-            state = _classify_position(pos, mark, hours_left, weather_report) if mark > 0 else STATE_LIVE
-            hold_ev = _model_hold_value(pos, mark, state, hours_left, weather_report) if mark > 0 else 0.0
-            exit_ev = (mark - SLIPPAGE_CENTS - FEE_CENTS) if mark > 0 else 0.0
+            state = _classify_position(pos, mark, hours_left, weather_report)
+            hold_ev = _model_hold_value(pos, mark, state, hours_left, weather_report)
+            exit_ev = mark - SLIPPAGE_CENTS - FEE_CENTS
             exitability = self._score_exitability(pos, liquidity)
 
-            # ── Stall scoring: count how many concern flags apply ─────────────
-            stall_flags = []
-
+            # ── Skip non-live states ──────────────────────────────────────────
             if state == STATE_BROKEN:
-                # Broken positions are handled by check_profit_takes; skip stall logic
+                # check_profit_takes() handles broken positions
                 continue
             if state in (STATE_LOCKED, STATE_NEAR_LOCKED):
-                # These are fine — capital is working
+                # Capital is working toward a profitable outcome — not a trap
+                self.state.stall_alert_counts.pop(pos.ticker, None)
                 continue
 
-            if hold_ev < STALL_HOLD_EV_CEILING:
-                stall_flags.append(f"weak_hold_ev({hold_ev:.1f}¢)")
+            # ── Stall flag scoring ────────────────────────────────────────────
+            stall_flags = []
+
+            # Hold EV is only meaningful as a stall signal when time is short.
+            # With >STALL_HOLD_EV_HOURS_THRESHOLD hours left, a mid-range hold EV
+            # (e.g. 44¢) simply means the market hasn't moved yet — not a trap.
+            if (hours_left is None or hours_left < STALL_HOLD_EV_HOURS_THRESHOLD) and \
+                    hold_ev < STALL_HOLD_EV_CEILING:
+                stall_flags.append(f"weak_hold_ev({hold_ev:.1f}¢,{hours_left:.1f}h_left)")
 
             if exit_ev < STALL_EXIT_EV_CEILING:
                 stall_flags.append(f"weak_exit_ev({exit_ev:.1f}¢)")
@@ -1258,45 +1326,78 @@ class PnLTracker:
 
             is_stalled = len(stall_flags) >= STALL_SCORE_THRESHOLD
 
-            if is_stalled:
-                # Determine recommended action based on severity
-                if exitability["score"] >= 50 and exit_ev > 5:
-                    action = "escalate_fair_value_exit"
-                elif exitability["score"] >= 20 and exit_ev > 2:
-                    action = "attempt_partial_reduction"
-                else:
-                    action = "monitor_and_log"
+            if not is_stalled:
+                # Position cleared stall criteria — reset its counter
+                self.state.stall_alert_counts.pop(pos.ticker, None)
+                continue
 
-                report = {
-                    "ticker": pos.ticker,
-                    "side": pos.side,
-                    "age_minutes": round(age_minutes, 1),
-                    "mark_cents": mark,
-                    "entry_price_cents": pos.entry_price,
-                    "hold_ev": round(hold_ev, 2),
-                    "exit_ev": round(exit_ev, 2),
-                    "exitability_score": exitability["score"],
-                    "exitability_flags": exitability["flags"],
-                    "spread_cents": spread,
-                    "total_volume_dollars": liquidity.get("total_volume", 0.0),
-                    "hours_left": hours_left,
-                    "state": state,
-                    "stall_flags": stall_flags,
-                    "stall_flag_count": len(stall_flags),
-                    "action": action,
-                    "remaining_contracts": remaining,
-                    "cost_dollars": pos.cost_dollars,
-                }
+            tickers_stalled_this_cycle.add(pos.ticker)
 
-                logger.warning(
-                    f"STALLED_POSITION {pos.ticker} {pos.side.upper()} | "
-                    f"age={age_minutes:.0f}min mark={mark}¢ state={state} | "
-                    f"hold_ev={hold_ev:.1f}¢ exit_ev={exit_ev:.1f}¢ "
-                    f"exitability={exitability['score']}/100 | "
-                    f"flags={stall_flags} | action={action}"
-                )
+            # ── Consecutive stall cycle tracking ─────────────────────────────
+            prev_count = self.state.stall_alert_counts.get(pos.ticker, 0)
+            stall_cycle = prev_count + 1
+            self.state.stall_alert_counts[pos.ticker] = stall_cycle
 
-                reports.append(report)
+            # ── Determine action — escalate after repeated cycles ─────────────
+            is_urgent = stall_cycle >= STALL_ESCALATION_CYCLES
+            if exitability["score"] >= 50 and exit_ev > 5:
+                action = "escalate_fair_value_exit"
+            elif exitability["score"] >= 20 and exit_ev > 2:
+                action = "attempt_partial_reduction"
+            else:
+                action = "monitor_and_log"
+            # Upgrade action if this has been stalled repeatedly and is still exitable
+            if is_urgent and action == "monitor_and_log" and exitability["score"] >= 15 and exit_ev > 1:
+                action = "attempt_partial_reduction"
+
+            # ── Decide whether to surface an alert this cycle ─────────────────
+            # Alert on first detection, then only every STALL_ALERT_EVERY_N_CYCLES.
+            # This prevents a 5-minute refresh loop from flooding Telegram.
+            should_alert = (stall_cycle == 1) or (stall_cycle % STALL_ALERT_EVERY_N_CYCLES == 0)
+
+            report = {
+                "ticker": pos.ticker,
+                "side": pos.side,
+                "age_minutes": round(age_minutes, 1),
+                "mark_cents": mark,
+                "entry_price_cents": pos.entry_price,
+                "hold_ev": round(hold_ev, 2),
+                "exit_ev": round(exit_ev, 2),
+                "exitability_score": exitability["score"],
+                "exitability_flags": exitability["flags"],
+                "spread_cents": spread,
+                "total_volume_dollars": liquidity.get("total_volume", 0.0),
+                "hours_left": hours_left,
+                "state": state,
+                "stall_flags": stall_flags,
+                "stall_flag_count": len(stall_flags),
+                "action": action,
+                "remaining_contracts": remaining,
+                "cost_dollars": pos.cost_dollars,
+                "stall_cycle": stall_cycle,
+                "is_urgent": is_urgent,
+                "should_alert": should_alert,
+            }
+
+            logger.warning(
+                f"STALLED_POSITION {pos.ticker} {pos.side.upper()} "
+                f"[cycle={stall_cycle}{'★URGENT' if is_urgent else ''}] | "
+                f"age={age_minutes:.0f}min mark={mark}¢ state={state} "
+                f"hrs_left={f'{hours_left:.1f}' if hours_left is not None else 'N/A'} | "
+                f"hold_ev={hold_ev:.1f}¢ exit_ev={exit_ev:.1f}¢ "
+                f"exitability={exitability['score']}/100 | "
+                f"flags={stall_flags} | action={action}"
+            )
+
+            reports.append(report)
+
+        # Reset counters for any ticker that was previously stalled but not seen this cycle
+        for ticker in list(self.state.stall_alert_counts.keys()):
+            if ticker not in tickers_stalled_this_cycle:
+                self.state.stall_alert_counts.pop(ticker, None)
+
+        # Persist stall counts so they survive across the 5-min refresh cycles
+        self._save()
 
         return reports
 

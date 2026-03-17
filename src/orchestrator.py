@@ -243,16 +243,26 @@ class Orchestrator:
                         f"TRADING HALTED\n{self.tracker.format_summary()}"
                     )
 
-            # Check for stalled / capital-trap positions and alert if found
+            # Check for stalled / capital-trap positions and alert if warranted
             try:
                 stalled = self.tracker.classify_stalled_positions()
                 for report in stalled:
+                    # Only alert when the report says to (deduped by stall cycle count)
+                    if not report.get("should_alert", False):
+                        continue
+                    # Always log monitor-only at WARNING; only Telegram-alert for actionable cases
+                    cycle = report.get("stall_cycle", 1)
+                    urgent_marker = " ★URGENT" if report.get("is_urgent") else ""
+                    repeat_context = f" (repeat #{cycle})" if cycle > 1 else " (first detection)"
                     if self.bot and report["action"] in ("escalate_fair_value_exit", "attempt_partial_reduction"):
+                        hrs = report["hours_left"]
+                        hrs_str = f"{hrs:.1f}" if hrs is not None else "N/A"
                         await self.bot.send_alert(
-                            f"CAPITAL TRAP [{report['action'].upper()}] "
+                            f"CAPITAL TRAP [{report['action'].upper()}]{urgent_marker}{repeat_context}\n"
                             f"{report['ticker']} {report['side'].upper()} | "
                             f"age={report['age_minutes']:.0f}min "
-                            f"mark={report['mark_cents']}¢ state={report['state']} | "
+                            f"mark={report['mark_cents']}¢ state={report['state']} "
+                            f"hrs_left={hrs_str} | "
                             f"hold_ev={report['hold_ev']:.1f}¢ exit_ev={report['exit_ev']:.1f}¢ "
                             f"exitability={report['exitability_score']}/100 | "
                             f"flags={report['stall_flags']}"
@@ -511,6 +521,20 @@ class Orchestrator:
         Gets trade recommendations and executes approved ones if trading is allowed.
         """
         logger.info("Starting market scan...")
+
+        # Refresh pending buy capital immediately before evaluating can_trade().
+        # The balance-refresh job runs every 5 min; the scan runs every 10 min.
+        # Without this, pending_buy_dollars could be up to ~5 min stale, causing
+        # can_trade() to see an overly optimistic effective-available-capital value
+        # if buy orders filled or were placed since the last fill check.
+        try:
+            current_resting = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.kalshi.get_orders(status="resting")
+            )
+            self._update_pending_buy_capital(current_resting)
+        except Exception as e:
+            logger.warning(f"run_scan: could not refresh pending buy capital: {e}")
+
         daily_budget = self.tracker.state.current_balance
         trades_used = self.tracker.state.trades_placed
         open_position_cost = sum(
