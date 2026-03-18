@@ -729,10 +729,17 @@ class Orchestrator:
 
     async def _record_settlement_errors(self):
         """
-        Fetches NWS actual observations for each city and compares to yesterday's
-        forecast. Saves errors to data/forecast_errors.json.
+        Fetches NWS actual observations for each city and compares to the NWS
+        forecast for that day. Saves errors to data/forecast_errors.json.
+
+        actual_high: max temperature observed during daytime (06:00–21:00 local).
+        actual_low:  min temperature observed during the overnight window
+                     (18:00 previous day – 10:00 local) to match Kalshi settlement.
+                     This prevents afternoon readings from contaminating the low.
         """
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        from zoneinfo import ZoneInfo
+        from src.analysis.engine import CITY_TIMEZONES
+
         season = _get_season_for_date(date.today().isoformat())
 
         # Load existing errors
@@ -757,26 +764,55 @@ class Orchestrator:
         for city, station in CITY_STATIONS.items():
             try:
                 url = f"{NWS_BASE}/stations/{station}/observations"
-                resp = http.get(url, params={"limit": 24})
+                resp = http.get(url, params={"limit": 36})  # 36h covers full overnight window
                 resp.raise_for_status()
                 features = resp.json().get("features", [])
 
                 if not features:
                     continue
 
-                # Extract temperature readings from the last 24 observations
-                temps_f = []
+                # Resolve city timezone for windowed high/low extraction
+                tz_name = CITY_TIMEZONES.get(city, "America/Chicago")
+                try:
+                    city_tz = ZoneInfo(tz_name)
+                except Exception:
+                    city_tz = ZoneInfo("America/Chicago")
+
+                daytime_temps_f = []   # 06:00–21:00 local → actual_high
+                overnight_temps_f = [] # 18:00 prev day – 10:00 local → actual_low
+
                 for feat in features:
                     props = feat.get("properties", {})
                     temp_c = props.get("temperature", {}).get("value")
-                    if temp_c is not None:
-                        temps_f.append(round(temp_c * 9 / 5 + 32, 1))
+                    obs_time_str = props.get("timestamp")
+                    if temp_c is None or obs_time_str is None:
+                        continue
+                    try:
+                        obs_utc = datetime.fromisoformat(obs_time_str.replace("Z", "+00:00"))
+                        obs_local = obs_utc.astimezone(city_tz)
+                    except Exception:
+                        continue
+                    temp_f = round(temp_c * 9 / 5 + 32, 1)
+                    local_h = obs_local.hour
+                    obs_date = obs_local.date()
+                    today_local = datetime.now(city_tz).date()
 
-                if not temps_f:
+                    # Daytime window for today: 06:00–21:00 local
+                    if obs_date == today_local and 6 <= local_h <= 21:
+                        daytime_temps_f.append(temp_f)
+
+                    # Overnight low window: yesterday 18:00 through today 10:00 local
+                    # This matches the period over which Kalshi settles KXLOWT* markets.
+                    yesterday_local = today_local - timedelta(days=1)
+                    if (obs_date == yesterday_local and local_h >= 18) or \
+                       (obs_date == today_local and local_h <= 10):
+                        overnight_temps_f.append(temp_f)
+
+                if not daytime_temps_f and not overnight_temps_f:
                     continue
 
-                actual_high = max(temps_f)
-                actual_low = min(temps_f)
+                actual_high = max(daytime_temps_f) if daytime_temps_f else None
+                actual_low = min(overnight_temps_f) if overnight_temps_f else None
 
                 # Get yesterday's NWS forecast for this city (from weather pipeline)
                 # Use the city in US_CITIES if available
@@ -791,8 +827,8 @@ class Orchestrator:
                 forecast_high = forecast.get("high_temp_f")
                 forecast_low = forecast.get("low_temp_f")
 
-                # Record high temp error
-                if forecast_high is not None:
+                # Record high temp error (requires daytime observations)
+                if forecast_high is not None and actual_high is not None:
                     error = forecast_high - actual_high   # positive = ran too warm
                     record = {
                         "city": city,
@@ -809,9 +845,11 @@ class Orchestrator:
                         f"forecast={forecast_high}°F actual={actual_high}°F "
                         f"error={error:+.1f}°F"
                     )
+                elif forecast_high is not None:
+                    logger.debug(f"Settlement error: {city} temp_high skipped — no daytime obs window")
 
-                # Record low temp error
-                if forecast_low is not None:
+                # Record low temp error (requires overnight observations)
+                if forecast_low is not None and actual_low is not None:
                     error = forecast_low - actual_low
                     record = {
                         "city": city,
@@ -828,6 +866,8 @@ class Orchestrator:
                         f"forecast={forecast_low}°F actual={actual_low}°F "
                         f"error={error:+.1f}°F"
                     )
+                elif forecast_low is not None:
+                    logger.debug(f"Settlement error: {city} temp_low skipped — no overnight obs window")
 
             except Exception as e:
                 logger.warning(f"Settlement error for {city}/{station}: {e}")

@@ -80,6 +80,26 @@ TRIM_BAND_SLIPPAGE_TOTAL = 4  # cents
 # ── Default forecast uncertainty fallback ─────────────────────────────────────
 DEFAULT_UNCERTAINTY_F = 7.0
 
+# ── Temp_low calibration bias protection thresholds ───────────────────────────
+# Applied per-city when recent forecast_errors show systematic cold bias.
+# Bias = forecast_value - actual_value, so strongly negative = forecasts too cold.
+#
+# WARNING level  (-8°F mean): log and apply modest edge increase (+3¢)
+# PENALTY level  (-15°F mean): widen sigma +4°F, increase edge req +5¢,
+#                              apply partial bias correction (50% of mean error)
+# BLOCK level    (-25°F mean): block temp_low trade for that city entirely
+#                              (requires MIN_BLOCK_SAMPLES to avoid 1-sample overreaction)
+TEMP_LOW_BIAS_WARN_F   = -8.0    # mean error threshold for warning
+TEMP_LOW_BIAS_PENALTY_F = -15.0  # mean error threshold for penalty
+TEMP_LOW_BIAS_BLOCK_F   = -25.0  # mean error threshold for blocking
+MIN_WARN_SAMPLES    = 2          # minimum samples to issue a warning
+MIN_PENALTY_SAMPLES = 3          # minimum samples to apply penalty
+MIN_BLOCK_SAMPLES   = 4          # minimum samples to trigger a block
+TEMP_LOW_PENALTY_SIGMA_ADD_F = 4.0   # extra sigma added at PENALTY level
+TEMP_LOW_PENALTY_EDGE_ADD    = 0.05  # extra edge required (cents as fraction) at PENALTY level
+TEMP_LOW_WARN_EDGE_ADD       = 0.03  # extra edge required at WARN level
+TEMP_LOW_BIAS_CORRECTION_FRAC = 0.5  # fraction of mean bias to subtract from forecast low
+
 # ── Monte Carlo settings ───────────────────────────────────────────────────────
 MC_PATHS = 2000             # number of simulated temperature paths
 
@@ -217,6 +237,42 @@ class TradeAnalysisEngine:
             }
         except Exception:
             self._uncertainty_cache = {}
+
+    def _load_forecast_calibration(self) -> dict:
+        """
+        Load the calibration summary from forecast_errors.json.
+        Returns dict keyed by "CITY/market_type" → {"mean": float, "n": int}.
+        Returns empty dict on any failure (never raises).
+        """
+        path = os.path.join(DATA_DIR, "forecast_errors.json")
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            return data.get("calibration", {})
+        except Exception:
+            return {}
+
+    def _get_temp_low_bias_status(
+        self, city: str, calibration: dict
+    ) -> tuple[str, float, int]:
+        """
+        Returns (level, mean_error, n_samples) for temp_low calibration of a city.
+        level is one of: "ok", "warn", "penalty", "block"
+        mean_error is the mean forecast error (forecast − actual); negative = forecast ran cold.
+        """
+        key = f"{city.upper()}/temp_low"
+        entry = calibration.get(key)
+        if not entry:
+            return "ok", 0.0, 0
+        mean_err = float(entry.get("mean", 0.0))
+        n = int(entry.get("n", 0))
+        if n >= MIN_BLOCK_SAMPLES and mean_err <= TEMP_LOW_BIAS_BLOCK_F:
+            return "block", mean_err, n
+        if n >= MIN_PENALTY_SAMPLES and mean_err <= TEMP_LOW_BIAS_PENALTY_F:
+            return "penalty", mean_err, n
+        if n >= MIN_WARN_SAMPLES and mean_err <= TEMP_LOW_BIAS_WARN_F:
+            return "warn", mean_err, n
+        return "ok", mean_err, n
 
     def _get_city_uncertainty(self, city: str, market_type: str) -> float:
         """
@@ -594,12 +650,30 @@ class TradeAnalysisEngine:
 
         # ── Score the market ───────────────────────────────────────────────────
         sigma = self._get_dynamic_sigma(city, market_type, hours_left)
+        calibration = self._load_forecast_calibration() if market_type == "temp_low" else {}
         score_result = self._score_market(
-            market_type, threshold, report, city, is_bucket, sigma, hours_left
+            market_type, threshold, report, city, is_bucket, sigma, hours_left,
+            calibration=calibration,
         )
         if score_result is None:
             return None
         base_prob, reasoning, forecast_summary = score_result
+
+        # ── Temp_low calibration block / extra-edge gate ───────────────────────
+        if market_type == "temp_low" and calibration:
+            bias_level, mean_bias, n_bias = self._get_temp_low_bias_status(city, calibration)
+            if bias_level == "block":
+                logger.warning(
+                    f"REJECTED {ticker}: temp_low BLOCKED for {city} — "
+                    f"calib mean_err={mean_bias:+.1f}°F n={n_bias} "
+                    f"(threshold: {TEMP_LOW_BIAS_BLOCK_F}°F, min_samples: {MIN_BLOCK_SAMPLES})"
+                )
+                self._record_missed_opportunity(
+                    ticker, city, market_type,
+                    f"temp_low_calib_block(mean={mean_bias:+.1f}F,n={n_bias})",
+                    base_prob, yes_price if yes_price else 0, 0.0,
+                )
+                return None
 
         # ── Determine best side using base probability ─────────────────────────
         if yes_price is None or no_price is None:
@@ -753,6 +827,22 @@ class TradeAnalysisEngine:
                 logger.debug(
                     f"{ticker}: city={city} edge penalty +{penalty_cents:.0f}¢ "
                     f"(source={city_adj.get('source', '?')}) → min_edge={min_edge_req:.3f}"
+                )
+
+        # Temp_low calibration edge surcharge (warn/penalty levels)
+        if market_type == "temp_low" and calibration:
+            bias_level, mean_bias, n_bias = self._get_temp_low_bias_status(city, calibration)
+            if bias_level == "penalty":
+                min_edge_req += TEMP_LOW_PENALTY_EDGE_ADD
+                logger.info(
+                    f"{ticker}: temp_low PENALTY edge surcharge +{TEMP_LOW_PENALTY_EDGE_ADD*100:.0f}¢ "
+                    f"calib mean_err={mean_bias:+.1f}°F n={n_bias} → min_edge={min_edge_req:.3f}"
+                )
+            elif bias_level == "warn":
+                min_edge_req += TEMP_LOW_WARN_EDGE_ADD
+                logger.info(
+                    f"{ticker}: temp_low WARN edge surcharge +{TEMP_LOW_WARN_EDGE_ADD*100:.0f}¢ "
+                    f"calib mean_err={mean_bias:+.1f}°F n={n_bias} → min_edge={min_edge_req:.3f}"
                 )
 
         if edge < min_edge_req:
@@ -1303,6 +1393,7 @@ class TradeAnalysisEngine:
         is_bucket: bool = False,
         sigma: float = DEFAULT_UNCERTAINTY_F,
         hours_to_close: Optional[float] = None,
+        calibration: Optional[dict] = None,
     ) -> Optional[tuple[float, str, str]]:
         """
         Returns (probability, reasoning, forecast_summary) or None if market type unsupported.
@@ -1357,25 +1448,60 @@ class TradeAnalysisEngine:
                 trend_adj = temp_trend * 2.0
                 trend_adj = max(-3.0, min(3.0, trend_adj))
 
-            corrected_low = low_temp + trend_adj
+            # ── Calibration bias correction for temp_low ──────────────────────
+            # If the forecast source has a systematic cold bias (forecasts too low),
+            # correct the forecast upward by a fraction of the observed mean error.
+            # mean_error = forecast − actual, so negative = forecast ran too cold.
+            # Correction: subtract the fractional bias from corrected_low
+            # (making the effective forecast warmer, consistent with the observation).
+            bias_level = "ok"
+            mean_bias = 0.0
+            n_bias_samples = 0
+            bias_correction = 0.0
+            sigma_penalty = 0.0
+
+            if calibration:
+                bias_level, mean_bias, n_bias_samples = self._get_temp_low_bias_status(
+                    city, calibration
+                )
+                if bias_level in ("penalty", "block"):
+                    # Apply partial bias correction (raise effective forecast)
+                    # mean_bias is negative, so subtracting it raises the forecast
+                    bias_correction = -mean_bias * TEMP_LOW_BIAS_CORRECTION_FRAC
+                    sigma_penalty = TEMP_LOW_PENALTY_SIGMA_ADD_F
+                elif bias_level == "warn":
+                    bias_correction = -mean_bias * TEMP_LOW_BIAS_CORRECTION_FRAC * 0.5
+
+            effective_sigma = sigma + sigma_penalty
+            corrected_low = low_temp + trend_adj + bias_correction
 
             if is_bucket:
                 # Bucket: P(threshold <= low <= threshold+2) = P(low <= threshold+2) - P(low <= threshold)
-                # = (1 - P(low > threshold+2)) - (1 - P(low > threshold)) = P(low > threshold) - P(low > threshold+2)
-                p_above_lo = self._sigmoid((corrected_low - threshold) / sigma)
-                p_above_hi = self._sigmoid((corrected_low - (threshold + 2.0)) / sigma)
+                p_above_lo = self._sigmoid((corrected_low - threshold) / effective_sigma)
+                p_above_hi = self._sigmoid((corrected_low - (threshold + 2.0)) / effective_sigma)
                 prob = p_above_lo - p_above_hi
             else:
                 # temp_low YES wins when low_temp <= threshold, so P(YES) = P(X <= threshold) = "below"
-                prob = self._monte_carlo_prob(corrected_low, threshold, sigma, "below")
+                prob = self._monte_carlo_prob(corrected_low, threshold, effective_sigma, "below")
 
             trend_str = f"{temp_trend:+.3f}" if temp_trend is not None else "N/A"
             reasoning = (
-                f"NWS low {low_temp}°F + trend_adj {trend_adj:+.1f}°F = {corrected_low:.1f}°F "
+                f"NWS low {low_temp}°F + trend_adj {trend_adj:+.1f}°F"
+                f"{f' + bias_correction {bias_correction:+.1f}°F' if bias_correction else ''}"
+                f" = {corrected_low:.1f}°F "
                 f"vs threshold {threshold}°F (gap: {corrected_low - threshold:+.1f}°F). "
                 f"{'Bucket market. ' if is_bucket else ''}"
-                f"Dynamic sigma={sigma:.1f}°F. "
-                f"Trend: {trend_str}°F/hr."
+                f"Dynamic sigma={sigma:.1f}°F"
+                f"{f' + penalty {sigma_penalty:+.1f}°F = {effective_sigma:.1f}°F' if sigma_penalty else ''}. "
+                f"Trend: {trend_str}°F/hr. "
+                f"Calib [{city}/temp_low]: level={bias_level} mean_err={mean_bias:+.1f}°F n={n_bias_samples}."
+            )
+            logger.info(
+                f"TEMP_LOW_SCORE | city={city} ticker_threshold={threshold}°F "
+                f"nws_low={low_temp}°F trend_adj={trend_adj:+.1f}°F bias_correction={bias_correction:+.1f}°F "
+                f"corrected_low={corrected_low:.1f}°F sigma={sigma:.1f}°F sigma_penalty={sigma_penalty:+.1f}°F "
+                f"effective_sigma={effective_sigma:.1f}°F prob={prob:.3f} "
+                f"calib_level={bias_level} mean_bias={mean_bias:+.1f}°F n={n_bias_samples}"
             )
             return prob, reasoning, forecast_summary
 
