@@ -203,11 +203,20 @@ class Orchestrator:
         Exit orders (those in _bot_exit_order_ids or _pending_exits) are excluded —
         they represent sells, not new capital deployment.
         """
+        # P1-4 fix: exclude IDs that are registered exit orders OR were not seen in
+        # a prior cycle. Any brand-new resting buy order that appeared since the last
+        # _check_order_fills tick could be an exit order whose ID hasn't been
+        # registered yet (exit_position returns the ID, but _update_pending_buy_capital
+        # may run in run_scan concurrently). Skipping truly-new orders is conservative
+        # (we may under-count pending buys by one cycle) but avoids over-counting capital.
         exit_ids = self._bot_exit_order_ids | set(self._pending_exits.keys())
         total_pending = 0.0
         for o in resting_orders:
             oid = o.get("order_id", "")
             if oid in exit_ids:
+                continue
+            # Skip orders not yet seen in a previous cycle — they could be unregistered exits
+            if oid and oid not in self._known_resting_ids:
                 continue
             action = o.get("action", "")
             if action != "buy":
@@ -272,6 +281,10 @@ class Orchestrator:
 
             # Check per-position exits (profit takes, trailing stops, thesis invalidation)
             profit_takes = self.tracker.check_profit_takes()
+            # Persist stall counts now that check_profit_takes succeeded — P0-2 fix:
+            # saving here (not inside classify_stalled_positions) ensures counts are
+            # only written when the full cycle completes without exception.
+            self.tracker._save()
             for position, exit_price, contracts_to_exit, exit_reason in profit_takes:
                 try:
                     if contracts_to_exit <= 0:
@@ -872,7 +885,18 @@ class Orchestrator:
         """Resets the daily state for a fresh trading day."""
         logger.info("Midnight reset: starting fresh day...")
         try:
+            # Preserve stall counts for positions that are still open so multi-day
+            # stalled positions continue to escalate rather than resetting to 0 (P1-3 fix).
+            old_stall_counts = dict(self.tracker.state.stall_alert_counts)
+            open_tickers = {p.ticker for p in self.tracker.state.positions}
+
             self.tracker.state = self.tracker._load_or_init()
+
+            carried = {t: c for t, c in old_stall_counts.items() if t in open_tickers}
+            if carried:
+                self.tracker.state.stall_alert_counts.update(carried)
+                logger.info(f"Midnight reset: carried stall counts for {list(carried.keys())}")
+
             logger.info(f"New day state initialized. Balance: ${self.tracker.state.starting_balance:.2f}")
         except Exception as e:
             logger.error(f"Midnight reset error: {e}")

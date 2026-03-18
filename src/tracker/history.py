@@ -10,6 +10,7 @@ Tracks missed opportunities (strong candidates that were rejected by the engine)
 import json
 import logging
 import os
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
@@ -29,6 +30,16 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "../../data")
 HISTORY_FILE = os.path.join(DATA_DIR, "trade_history.json")
 LEARNING_LOG_FILE = os.path.join(DATA_DIR, "learning_log.json")
 MISSED_OPP_FILE = os.path.join(DATA_DIR, "missed_opportunities.json")
+
+
+def _atomic_write(path: str, data) -> None:
+    """Write JSON atomically: write to a temp file then rename, so a crash
+    mid-write never leaves a partial/corrupt file at the target path."""
+    dir_ = os.path.dirname(path)
+    with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as f:
+        json.dump(data, f, indent=2)
+        tmp_path = f.name
+    os.replace(tmp_path, path)
 
 # ── Outcome thresholds ────────────────────────────────────────────────────────
 # Trades within ±SCRATCH_PNL_THRESHOLD of zero are classified as "scratch",
@@ -81,8 +92,7 @@ class DailyHistoryTracker:
             return []
 
     def _save_history(self, records: list):
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(records, f, indent=2)
+        _atomic_write(HISTORY_FILE, records)
 
     def _load_learning_log(self) -> list:
         try:
@@ -93,8 +103,7 @@ class DailyHistoryTracker:
             return []
 
     def _save_learning_log(self, log: list):
-        with open(LEARNING_LOG_FILE, "w") as f:
-            json.dump(log, f, indent=2)
+        _atomic_write(LEARNING_LOG_FILE, log)
 
     def _load_missed_opportunities(self) -> list:
         try:
@@ -105,8 +114,7 @@ class DailyHistoryTracker:
             return []
 
     def _save_missed_opportunities(self, records: list):
-        with open(MISSED_OPP_FILE, "w") as f:
-            json.dump(records, f, indent=2)
+        _atomic_write(MISSED_OPP_FILE, records)
 
     # -------------------------------------------------------------------------
     # Record a day

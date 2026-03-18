@@ -113,11 +113,12 @@ STATE_STALLED = "stalled"          # capital trap: poor EV, poor liquidity, no c
 # ─── Capital trap / stalled position thresholds ───────────────────────────────
 STALL_MIN_AGE_MINUTES = 45          # position must be at least this old to be flagged
 STALL_HOLD_EV_CEILING = 45.0        # hold EV below this (¢) raises concern when <2h left
-STALL_EXIT_EV_CEILING = 40.0        # exit EV below this (¢) raises concern
+STALL_EXIT_EV_CEILING = 35.0        # exit EV below this (¢) raises concern
 STALL_SPREAD_WIDE_CENTS = 10        # spread at or above this is "wide"
 STALL_POOR_LIQUIDITY_DOLLARS = 2.0  # total book depth below this is "poor"
 STALL_MFE_REQUIRED_CENTS = 3        # if HWM never exceeded entry+this, no favorable excursion
 STALL_SCORE_THRESHOLD = 3           # flags needed (out of 7) to be classified stalled
+STALL_EXIT_MIN_MARK_CENTS = 10      # forced EXIT_STALLED requires mark ≥ this (avoids nuking near-worthless positions)
 # Time-aware hold EV ceiling: with >2h left the market is still live; only apply
 # the EV ceiling when time is short enough that the mark is likely anchored.
 STALL_HOLD_EV_HOURS_THRESHOLD = 2.0  # only penalise hold EV when <2h left
@@ -542,6 +543,8 @@ class Position:
     entry_liquidity_dollars: Optional[float] = None  # executable liquidity at entry
     # ── Fragile-trade flags ───────────────────────────────────────────────────
     fragile_flags: list = field(default_factory=list)  # e.g. ["low_price_entry"]
+    # ── Cached market metadata ────────────────────────────────────────────────
+    close_time: Optional[str] = None  # cached from Kalshi API; avoids repeated calls every 5 min
 
 
 @dataclass
@@ -933,8 +936,9 @@ class PnLTracker:
                 continue
 
             # ── Settlement timing ─────────────────────────────────────────────
-            close_time_str = _get_close_time(pos.ticker, self.kalshi)
-            hours_left = _hours_to_settlement(close_time_str)
+            if not pos.close_time:
+                pos.close_time = _get_close_time(pos.ticker, self.kalshi)
+            hours_left = _hours_to_settlement(pos.close_time)
 
             # ── Weather data (best-effort) ────────────────────────────────────
             weather_report = None
@@ -1093,7 +1097,10 @@ class PnLTracker:
                 stall_cycles = self.state.stall_alert_counts.get(pos.ticker, 0)
                 if stall_cycles >= STALL_ESCALATION_CYCLES:
                     _stall_exit_ev = mark - SLIPPAGE_CENTS - FEE_CENTS
-                    if _stall_exit_ev > 1:  # must recover at least something
+                    # Require a meaningful mark price (≥ STALL_EXIT_MIN_MARK_CENTS) so we
+                    # don't force-exit a position that is still trading at a non-trivial
+                    # level just because exit EV clears the 1¢ floor (P1-2 fix).
+                    if _stall_exit_ev > 1 and mark >= STALL_EXIT_MIN_MARK_CENTS:
                         exit_contracts = remaining
                         exit_reason = EXIT_STALLED
                         logger.warning(
@@ -1271,8 +1278,10 @@ class PnLTracker:
                 logger.debug(f"STALL_CHECK: no mark for {pos.ticker} {pos.side} — skipping")
                 continue
 
-            close_time_str = _get_close_time(pos.ticker, self.kalshi)
-            hours_left = _hours_to_settlement(close_time_str)
+            # Use cached close_time to avoid an API call every 5-min cycle (P2 fix).
+            if not pos.close_time:
+                pos.close_time = _get_close_time(pos.ticker, self.kalshi)
+            hours_left = _hours_to_settlement(pos.close_time)
 
             weather_report = None
             if self.weather:
@@ -1318,9 +1327,14 @@ class PnLTracker:
             if liquidity.get("total_volume", 0.0) < STALL_POOR_LIQUIDITY_DOLLARS:
                 stall_flags.append(f"poor_liquidity(${liquidity.get('total_volume', 0):.2f})")
 
-            hwm = pos.high_water_mark if pos.high_water_mark is not None else pos.entry_price
-            if hwm <= pos.entry_price + STALL_MFE_REQUIRED_CENTS:
-                stall_flags.append(f"no_favorable_excursion(hwm={hwm}¢ entry={pos.entry_price}¢)")
+            # Only check MFE if high_water_mark has been set — it's populated by
+            # check_profit_takes(), so a brand-new position that hasn't been through
+            # that loop yet would always trigger this flag spuriously (P2 fix).
+            if pos.high_water_mark is not None:
+                if pos.high_water_mark <= pos.entry_price + STALL_MFE_REQUIRED_CENTS:
+                    stall_flags.append(
+                        f"no_favorable_excursion(hwm={pos.high_water_mark}¢ entry={pos.entry_price}¢)"
+                    )
 
             if hours_left is not None and hours_left < 1.0 and mark <= 30:
                 stall_flags.append(f"late_and_losing(hrs={hours_left:.1f} mark={mark}¢)")
@@ -1397,8 +1411,9 @@ class PnLTracker:
             if ticker not in tickers_stalled_this_cycle:
                 self.state.stall_alert_counts.pop(ticker, None)
 
-        # Persist stall counts so they survive across the 5-min refresh cycles
-        self._save()
+        # NOTE: _save() is intentionally NOT called here.
+        # Stall counts are persisted by the orchestrator after check_profit_takes()
+        # completes, so a crash in check_profit_takes can't overcount cycles.
 
         return reports
 
