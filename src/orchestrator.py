@@ -23,7 +23,7 @@ from src.tracker.history import DailyHistoryTracker, _get_season_for_date
 logger = logging.getLogger(__name__)
 
 SCAN_INTERVAL_MINUTES = 10
-MAX_TRADES_PER_DAY = 999999  # unlimited — cash reserve enforces the real limit
+MAX_TRADES_PER_DAY = 10  # hard cap: top 10 highest-conviction trades per day
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "../data")
 
@@ -554,6 +554,11 @@ class Orchestrator:
             p.cost_dollars for p in self.tracker.state.positions if p.status == "open"
         )
 
+        logger.info(
+            f"SCAN_START trades_used={trades_used}/{MAX_TRADES_PER_DAY} "
+            f"balance=${daily_budget:.2f} open_cost=${open_position_cost:.2f}"
+        )
+
         try:
             recommendations = await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -565,7 +570,9 @@ class Orchestrator:
             logger.error(f"Failed to get recommendations: {e}")
             return
 
-        logger.info(f"Scan found {len(recommendations)} recommendations.")
+        logger.info(
+            f"SCAN_RESULT selected={len(recommendations)} trades_used={trades_used}/{MAX_TRADES_PER_DAY}"
+        )
 
         # Update fast-scan snapshot with cities from current recommendations
         now_utc = datetime.now(timezone.utc)
@@ -616,6 +623,12 @@ class Orchestrator:
             except Exception as e:
                 logger.warning(f"Could not check resting orders before trade ({rec.ticker}): {e}")
 
+            # Single aggregated order — N contracts submitted as one request, not N separate orders.
+            logger.info(
+                f"ORDER_SUBMIT {rec.ticker} {rec.side.upper()} "
+                f"contracts={rec.contracts} (aggregated single order) "
+                f"price={rec.market_price}¢ cost=${rec.cost_dollars:.2f}"
+            )
             order_resp = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.kalshi.place_order(
@@ -642,8 +655,9 @@ class Orchestrator:
             )
 
             logger.info(
-                f"Trade placed: {rec.ticker} {rec.side.upper()} x{rec.contracts} "
-                f"@ {rec.market_price}¢ | order_id={order_id}"
+                f"ORDER_CONFIRMED {rec.ticker} {rec.side.upper()} x{rec.contracts} "
+                f"@ {rec.market_price}¢ | order_id={order_id} | "
+                f"daily_trades_after={self.tracker.state.trades_placed}"
             )
 
             if self.bot:

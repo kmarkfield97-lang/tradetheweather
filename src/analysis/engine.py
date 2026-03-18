@@ -41,7 +41,7 @@ MAX_SPREAD_PCT = 0.25       # or 25% of contract price, whichever is more restri
 MIN_EXECUTABLE_LIQUIDITY = 25.0   # require $25 within 5¢ of mid price
 MIN_PRICE_CENTS = 15        # skip markets priced below 15¢ (near-certain outcomes)
 MIN_PRICE_CENTS_HIGH_EDGE = 10    # allow down to 10¢ if edge is extremely large (>20¢)
-MAX_TRADES_PER_DAY = 999999
+MAX_TRADES_PER_DAY = 10  # hard cap: only take the top 10 highest-conviction trades per day
 
 # ── Edge thresholds (dynamic by liquidity tier) ────────────────────────────────
 MIN_EDGE_HIGH_LIQ = 0.05    # 5¢ — deep orderbook
@@ -445,6 +445,56 @@ class TradeAnalysisEngine:
             logger.warning(f"apply_history_insights error: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Conviction scoring
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _conviction_score(rec: "TradeRecommendation") -> float:
+        """
+        Multi-factor conviction score used to rank candidates when more than
+        MAX_TRADES_PER_DAY qualify.  Higher is better.
+
+        Components (each normalised to a 0–1 contribution):
+          • adjusted edge (50%) — primary monetisable-edge driver
+          • signal_agreement (20%) — how many signals agree
+          • model certainty (15%) — inverse of model_uncertainty
+          • liquidity (10%) — executable $ near mid
+          • confidence tier (5%) — high/medium/low discrete penalty
+        """
+        ctx = rec.entry_context or {}
+
+        # 1. Adjusted edge: use tradable_edge_cents when available (accounts for trim band
+        #    discounts), otherwise fall back to raw edge.
+        tradable_cents = ctx.get("tradable_edge_cents")
+        if tradable_cents is not None:
+            edge_component = max(0.0, tradable_cents / 100.0)
+        else:
+            edge_component = max(0.0, rec.edge)
+
+        # 2. Signal agreement (0–1 already)
+        agreement = ctx.get("signal_agreement", 0.5)
+
+        # 3. Model certainty — invert uncertainty so higher certainty = higher score
+        uncertainty = ctx.get("model_uncertainty", rec.model_uncertainty)
+        certainty = max(0.0, 1.0 - uncertainty)
+
+        # 4. Liquidity — normalise $0–$200 executable depth to 0–1
+        exec_liq = ctx.get("exec_liq", 0.0) or 0.0
+        liquidity_norm = min(1.0, exec_liq / 200.0)
+
+        # 5. Confidence tier
+        conf_bonus = {"high": 1.0, "medium": 0.6, "low": 0.2}.get(rec.confidence, 0.4)
+
+        score = (
+            0.50 * edge_component
+            + 0.20 * agreement
+            + 0.15 * certainty
+            + 0.10 * liquidity_norm
+            + 0.05 * conf_bonus
+        )
+        return round(score, 6)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Main entry point
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -455,41 +505,86 @@ class TradeAnalysisEngine:
         open_position_cost: float = 0.0,
     ) -> list[TradeRecommendation]:
         """
-        Scans all open Kalshi weather markets, scores them, and returns
-        ranked trade recommendations that fit within the daily rules.
+        Scans all open Kalshi weather markets, scores them, and returns the
+        top MAX_TRADES_PER_DAY highest-conviction recommendations that fit
+        within the daily rules.
+
+        Selection process:
+          1. Evaluate every market; collect all candidates that pass filters.
+          2. Deduplicate to one trade per (city, market_type).
+          3. Rank survivors by _conviction_score (multi-factor: edge, agreement,
+             certainty, liquidity, confidence tier).
+          4. Cap at (MAX_TRADES_PER_DAY - trades_used); log skipped candidates.
         """
         trades_remaining = MAX_TRADES_PER_DAY - trades_used
         if trades_remaining <= 0:
+            logger.info(
+                f"DAILY_CAP_REACHED trades_used={trades_used} "
+                f"max={MAX_TRADES_PER_DAY} — no further trades today"
+            )
             return []
 
         markets = self.kalshi.get_weather_markets()
-        recommendations = []
+        candidates = []
 
         for market in markets:
             ticker = market.get("ticker", "")
             try:
                 rec = self._evaluate_market(market, daily_budget, open_position_cost)
                 if rec:
-                    recommendations.append(rec)
+                    candidates.append(rec)
                 else:
                     logger.debug(f"REJECTED {ticker}: no recommendation returned")
             except Exception as e:
                 logger.warning(f"REJECTED {ticker}: exception during evaluation — {e}")
                 continue
 
-        # Sort by edge descending (best opportunity first)
-        recommendations.sort(key=lambda r: r.edge, reverse=True)
-
         # Deduplicate: only one trade per city+market_type to avoid contradictory positions.
         seen: set = set()
         deduped = []
-        for rec in recommendations:
+        for rec in sorted(candidates, key=lambda r: r.edge, reverse=True):
             key = (rec.city, rec.market_type)
             if key not in seen:
                 seen.add(key)
                 deduped.append(rec)
 
-        return deduped[:trades_remaining]
+        # Rank by conviction score (multi-factor)
+        for rec in deduped:
+            rec._conviction = self._conviction_score(rec)  # type: ignore[attr-defined]
+        deduped.sort(key=lambda r: getattr(r, "_conviction", 0.0), reverse=True)
+
+        # Log full ranked candidate list
+        logger.info(
+            f"CANDIDATE_RANKING trades_used={trades_used} "
+            f"cap={MAX_TRADES_PER_DAY} candidates={len(deduped)}"
+        )
+        for rank, rec in enumerate(deduped, start=1):
+            score = getattr(rec, "_conviction", 0.0)
+            ctx = rec.entry_context or {}
+            marker = "SELECT" if rank <= trades_remaining else "SKIP_CAP"
+            agreement = ctx.get("signal_agreement", 0.5)
+            uncertainty = ctx.get("model_uncertainty", rec.model_uncertainty)
+            exec_liq = ctx.get("exec_liq", 0) or 0
+            logger.info(
+                f"  RANK_{rank:02d} [{marker}] {rec.ticker} "
+                f"conviction={score:.4f} edge={rec.edge:.3f} "
+                f"agreement={agreement:.2f} "
+                f"certainty={1.0 - uncertainty:.2f} "
+                f"liq=${exec_liq:.0f} "
+                f"confidence={rec.confidence} "
+                f"city={rec.city} type={rec.market_type}"
+            )
+
+        selected = deduped[:trades_remaining]
+        skipped = deduped[trades_remaining:]
+        if skipped:
+            skipped_tickers = [r.ticker for r in skipped]
+            logger.info(
+                f"SKIPPED_BY_CAP {len(skipped)} candidates not executed "
+                f"(daily limit {MAX_TRADES_PER_DAY} trades): {skipped_tickers}"
+            )
+
+        return selected
 
     # ─────────────────────────────────────────────────────────────────────────
     # Market evaluation
