@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from src.kalshi.client import KalshiClient
 from src.weather.pipeline import WeatherPipeline
+from src.analysis import operating_profile as op_profile
 from src.signals import aggregator as signal_aggregator
 from src.signals import (
     station_bias,
@@ -41,7 +42,9 @@ MAX_SPREAD_PCT = 0.25       # or 25% of contract price, whichever is more restri
 MIN_EXECUTABLE_LIQUIDITY = 25.0   # require $25 within 5¢ of mid price
 MIN_PRICE_CENTS = 15        # skip markets priced below 15¢ (near-certain outcomes)
 MIN_PRICE_CENTS_HIGH_EDGE = 10    # allow down to 10¢ if edge is extremely large (>20¢)
-MAX_TRADES_PER_DAY = 10  # hard cap: only take the top 10 highest-conviction trades per day
+MAX_TRADES_PER_DAY = 15  # hard cap: only take the top 15 highest-conviction trades per day
+# Trades ranked above this threshold face tighter quality checks (see _passes_extended_quality_gate).
+EXTENDED_QUALITY_RANK_THRESHOLD = 10  # ranks 11–15 are subject to extended gates
 
 # ── Edge thresholds (dynamic by liquidity tier) ────────────────────────────────
 MIN_EDGE_HIGH_LIQ = 0.05    # 5¢ — deep orderbook
@@ -136,6 +139,24 @@ TEMP_LOW_EXTREME_SIGMA_F        = 10.0  # °F
 TEMP_LOW_EXTREME_SIGMA_EDGE     = 0.05  # +5¢ extra when sigma > 10°F
 TEMP_LOW_POOR_CALIB_MIN_EDGE    = 0.12  # 12¢ minimum for warn/penalty temp_low
 
+# ── Extended quality gate (trades ranked 11–15) ───────────────────────────────
+# Trades ranked above EXTENDED_QUALITY_RANK_THRESHOLD face tighter checks so
+# expanding the daily cap from 10→15 does not dilute quality.
+#
+# EXT_MIN_TRADABLE_EDGE_CENTS   : minimum monetisable/tradable edge (¢); raw
+#                                 edge is used as fallback when tradable_edge
+#                                 is not available.
+# EXT_MIN_EXECUTABLE_LIQUIDITY  : stricter liquidity floor for slots 11–15
+# EXT_MIN_SIGNAL_AGREEMENT      : fraction of signals that must agree
+# EXT_MAX_CORRELATION_CITIES    : maximum number of already-selected trades
+#                                 from the same city before slot 11–15 is blocked
+# EXT_MAX_MODEL_UNCERTAINTY     : reject if model sigma exceeds this (°F)
+EXT_MIN_TRADABLE_EDGE_CENTS   = 8.0   # ≥ 8¢ monetisable edge required (vs normal tier 5–10¢)
+EXT_MIN_EXECUTABLE_LIQUIDITY  = 40.0  # $40 near-mid depth (vs normal $25)
+EXT_MIN_SIGNAL_AGREEMENT      = 0.60  # 60%+ signal agreement
+EXT_MAX_SAME_CITY_SELECTED    = 1     # block if city already has ≥2 selected trades
+EXT_MAX_MODEL_UNCERTAINTY     = 0.80  # reject if uncertainty > 0.80 (high-sigma setups)
+
 # ── Monte Carlo settings ───────────────────────────────────────────────────────
 MC_PATHS = 2000             # number of simulated temperature paths
 
@@ -216,6 +237,11 @@ class TradeRecommendation:
     # Passed through to record_trade() as entry_context so diagnostics have
     # the full picture of why the trade was entered.
     entry_context: dict = field(default_factory=dict)
+    # ── Quality tier (assigned during ranking in get_recommendations) ─────────
+    # "top_tier" / "standard" / "marginal" — drives modest size uplift for top_tier
+    # under balanced / profit_tilted operating profiles.
+    trade_tier: str = "standard"
+    trade_tier_reasons: list[str] = field(default_factory=list)
 
 
 class TradeAnalysisEngine:
@@ -654,21 +680,39 @@ class TradeAnalysisEngine:
         MAX_TRADES_PER_DAY qualify.  Higher is better.
 
         Components (each normalised to a 0–1 contribution):
-          • adjusted edge (50%) — primary monetisable-edge driver
+          • monetisable edge (50%) — tradable_edge_cents after trim-band drag;
+            penalised for near-trim-band proximity to improve exit-path awareness
           • signal_agreement (20%) — how many signals agree
           • model certainty (15%) — inverse of model_uncertainty
-          • liquidity (10%) — executable $ near mid
+          • liquidity (10%) — executable $ near mid; includes small spread bonus
           • confidence tier (5%) — high/medium/low discrete penalty
+
+        Monetisable-edge awareness improvements
+        ----------------------------------------
+        The edge component now uses tradable_edge_cents (already accounts for
+        trim-band drag at entry price) and applies an additional small penalty
+        for "near_trim_band" proximity — trades that are close to a trim band
+        but not inside it still have partially limited upside and should rank
+        slightly below trades with a clear path.
+
+        A narrow spread bonus (up to +5% of liquidity weight) rewards contracts
+        where exit slippage will be low, improving expected monetised outcome.
         """
         ctx = rec.entry_context or {}
 
-        # 1. Adjusted edge: use tradable_edge_cents when available (accounts for trim band
-        #    discounts), otherwise fall back to raw edge.
+        # 1. Monetisable edge: use tradable_edge_cents when available (accounts for
+        #    trim-band drag at entry).  Apply a near-trim-band proximity penalty.
         tradable_cents = ctx.get("tradable_edge_cents")
         if tradable_cents is not None:
             edge_component = max(0.0, tradable_cents / 100.0)
         else:
             edge_component = max(0.0, rec.edge)
+
+        # Near-trim-band penalty: modest ranking discount when upside is partially
+        # constrained.  Does not reject — just ensures cleaner entries rank higher.
+        trim_zone = ctx.get("trim_band_zone", "clear")
+        if trim_zone == "near_trim_band":
+            edge_component = edge_component * 0.90  # 10% discount for proximity
 
         # 2. Signal agreement (0–1 already)
         agreement = ctx.get("signal_agreement", 0.5)
@@ -677,9 +721,19 @@ class TradeAnalysisEngine:
         uncertainty = ctx.get("model_uncertainty", rec.model_uncertainty)
         certainty = max(0.0, 1.0 - uncertainty)
 
-        # 4. Liquidity — normalise $0–$200 executable depth to 0–1
+        # 4. Liquidity — normalise $0–$200 executable depth to 0–1, with a small
+        #    spread-efficiency bonus (tighter spread → better exit monetisation).
         exec_liq = ctx.get("exec_liq", 0.0) or 0.0
         liquidity_norm = min(1.0, exec_liq / 200.0)
+        # Spread bonus: 0.0–0.05 added to liquidity_norm when spread is tight
+        spread_cents = ctx.get("spread") or 0
+        price_cents = rec.market_price or 50
+        if spread_cents > 0 and price_cents > 0:
+            spread_ratio = spread_cents / price_cents
+            if spread_ratio <= 0.05:
+                liquidity_norm = min(1.0, liquidity_norm + 0.05)   # tight spread bonus
+            elif spread_ratio <= 0.10:
+                liquidity_norm = min(1.0, liquidity_norm + 0.02)   # modest spread bonus
 
         # 5. Confidence tier
         conf_bonus = {"high": 1.0, "medium": 0.6, "low": 0.2}.get(rec.confidence, 0.4)
@@ -692,6 +746,191 @@ class TradeAnalysisEngine:
             + 0.05 * conf_bonus
         )
         return round(score, 6)
+
+    @staticmethod
+    def _classify_trade_tier(rec: "TradeRecommendation") -> tuple[str, list[str]]:
+        """
+        Classify a trade candidate into a quality tier.
+
+        Tiers
+        -----
+        top_tier  — best setups; eligible for modest size uplift under
+                    balanced / profit_tilted profiles.  All of the following
+                    must hold (fragile-flag veto applies unconditionally):
+                      • conviction score ≥ profile top_tier_conviction_min
+                      • tradable edge ≥ profile top_tier_min_edge_cents
+                      • signal agreement ≥ profile top_tier_min_signal_agreement
+                      • model uncertainty ≤ profile top_tier_max_model_uncertainty
+                      • exec liquidity ≥ profile top_tier_min_exec_liq
+                      • disagree_classification != "dangerous"
+                      • NOT a low-price fragile entry
+                      • NOT a temp_low with poor calibration (warn/penalty/block)
+                      • NOT classified as near a trim band (upside already limited)
+                      • confidence tier is "high"
+
+        standard  — normal setups; sized at baseline.
+
+        marginal  — low-conviction setups; sized at baseline (may be at or
+                    below standard thresholds).
+
+        Returns (tier_label, reasons_list).
+        """
+        ctx = rec.entry_context or {}
+        prof = op_profile.get_profile_params()
+
+        conviction = getattr(rec, "_conviction", 0.0)
+
+        tradable_cents = ctx.get("tradable_edge_cents")
+        edge_cents = tradable_cents if tradable_cents is not None else rec.edge * 100.0
+
+        agreement = ctx.get("signal_agreement", 0.0)
+        uncertainty = ctx.get("model_uncertainty", rec.model_uncertainty)
+        exec_liq = ctx.get("exec_liq", 0.0) or 0.0
+        disagree_cls = ctx.get("disagree_classification", "actionable")
+        is_low_price = ctx.get("is_low_price_entry", False)
+        calib = ctx.get("calib_bias_level", "ok")
+        trim_zone = ctx.get("trim_band_zone", "clear")
+        confidence = rec.confidence
+
+        # ── Hard vetoes — never top-tier regardless of profile ────────────────
+        # These mirror the same strict categories that the extended quality gate
+        # and the existing fragile-trade guards protect against.  Using them here
+        # ensures top-tier sizing is never awarded to risky setups.
+        veto_reasons: list[str] = []
+        if is_low_price:
+            veto_reasons.append(f"low_price_entry(price<{LOW_PRICE_GATE_CENTS}¢)")
+        if disagree_cls == "dangerous":
+            veto_reasons.append("dangerous_disagree")
+        if calib in ("warn", "penalty", "block") and rec.market_type == "temp_low":
+            veto_reasons.append(f"poor_temp_low_calib({calib})")
+        if trim_zone not in ("clear", "near_trim_band"):
+            # inside an active trim band — upside already limited
+            veto_reasons.append(f"inside_trim_band({trim_zone})")
+        if confidence != "high":
+            veto_reasons.append(f"confidence_not_high({confidence})")
+
+        if veto_reasons:
+            # Still assign standard vs marginal based on conviction
+            tier = "standard" if conviction >= prof["standard_tier_conviction_min"] else "marginal"
+            return tier, [f"top_tier_vetoed: {veto_reasons}"]
+
+        # ── Top-tier criteria (all must pass) ─────────────────────────────────
+        fail_reasons: list[str] = []
+        if conviction < prof["top_tier_conviction_min"]:
+            fail_reasons.append(
+                f"conviction {conviction:.4f} < {prof['top_tier_conviction_min']:.2f}"
+            )
+        if edge_cents < prof["top_tier_min_edge_cents"]:
+            fail_reasons.append(
+                f"edge {edge_cents:.1f}¢ < {prof['top_tier_min_edge_cents']:.0f}¢"
+            )
+        if agreement < prof["top_tier_min_signal_agreement"]:
+            fail_reasons.append(
+                f"agreement {agreement:.2f} < {prof['top_tier_min_signal_agreement']:.2f}"
+            )
+        if uncertainty > prof["top_tier_max_model_uncertainty"]:
+            fail_reasons.append(
+                f"uncertainty {uncertainty:.2f} > {prof['top_tier_max_model_uncertainty']:.2f}"
+            )
+        if exec_liq < prof["top_tier_min_exec_liq"]:
+            fail_reasons.append(
+                f"exec_liq ${exec_liq:.0f} < ${prof['top_tier_min_exec_liq']:.0f}"
+            )
+
+        if not fail_reasons:
+            return "top_tier", [
+                f"conviction={conviction:.4f} edge={edge_cents:.1f}¢ "
+                f"agreement={agreement:.2f} uncertainty={uncertainty:.2f} "
+                f"exec_liq=${exec_liq:.0f} profile={op_profile.ACTIVE_PROFILE}"
+            ]
+
+        # ── Standard vs marginal ──────────────────────────────────────────────
+        tier = "standard" if conviction >= prof["standard_tier_conviction_min"] else "marginal"
+        return tier, fail_reasons
+
+    @staticmethod
+    def _passes_extended_quality_gate(
+        rec: "TradeRecommendation",
+        selected_so_far: list["TradeRecommendation"],
+    ) -> tuple[bool, str]:
+        """
+        Extra quality checks applied only to trades ranked 11–15 (ranks above
+        EXTENDED_QUALITY_RANK_THRESHOLD).  Returns (passes, reason_string).
+
+        Rules (all must pass):
+          1. Monetisable edge ≥ EXT_MIN_TRADABLE_EDGE_CENTS
+          2. Executable liquidity ≥ EXT_MIN_EXECUTABLE_LIQUIDITY
+          3. Signal agreement ≥ EXT_MIN_SIGNAL_AGREEMENT
+          4. City concentration: block if this city already has > EXT_MAX_SAME_CITY_SELECTED
+             trades in selected_so_far (prevents over-loading one city at slots 11–15)
+          5. Model uncertainty ≤ EXT_MAX_MODEL_UNCERTAINTY
+          6. No severe temp_low calibration block (calib_bias_level == "block")
+          7. No fragile low-price + dangerous-disagreement combination
+             (is_low_price_entry=True and disagree_classification="dangerous")
+          8. No weak temp_low in a poorly calibrated city
+             (market_type="temp_low" and calib_bias_level in {"warn", "penalty"})
+        """
+        ctx = rec.entry_context or {}
+
+        # 1. Monetisable edge
+        tradable_cents = ctx.get("tradable_edge_cents")
+        edge_cents = tradable_cents if tradable_cents is not None else rec.edge * 100.0
+        if edge_cents < EXT_MIN_TRADABLE_EDGE_CENTS:
+            return False, (
+                f"EXT_GATE edge {edge_cents:.1f}¢ < required {EXT_MIN_TRADABLE_EDGE_CENTS:.0f}¢"
+            )
+
+        # 2. Executable liquidity
+        exec_liq = ctx.get("exec_liq", 0.0) or 0.0
+        if exec_liq < EXT_MIN_EXECUTABLE_LIQUIDITY:
+            return False, (
+                f"EXT_GATE liq ${exec_liq:.0f} < required ${EXT_MIN_EXECUTABLE_LIQUIDITY:.0f}"
+            )
+
+        # 3. Signal agreement
+        agreement = ctx.get("signal_agreement", 0.0)
+        if agreement < EXT_MIN_SIGNAL_AGREEMENT:
+            return False, (
+                f"EXT_GATE agreement {agreement:.2f} < required {EXT_MIN_SIGNAL_AGREEMENT:.2f}"
+            )
+
+        # 4. City concentration among already-selected trades
+        city_count = sum(1 for s in selected_so_far if s.city == rec.city)
+        if city_count >= EXT_MAX_SAME_CITY_SELECTED + 1:
+            return False, (
+                f"EXT_GATE city={rec.city} already has {city_count} selected trades "
+                f"(max {EXT_MAX_SAME_CITY_SELECTED} for extended slots)"
+            )
+
+        # 5. Model uncertainty
+        uncertainty = ctx.get("model_uncertainty", rec.model_uncertainty)
+        if uncertainty > EXT_MAX_MODEL_UNCERTAINTY:
+            return False, (
+                f"EXT_GATE uncertainty {uncertainty:.2f} > max {EXT_MAX_MODEL_UNCERTAINTY:.2f}"
+            )
+
+        # 6. Severe calibration block (temp_low calib_bias_level == "block")
+        if ctx.get("calib_bias_level") == "block":
+            return False, "EXT_GATE calib_bias_level=block (severe temp_low calibration warning)"
+
+        # 7. Fragile low-price + dangerous-disagreement combination.
+        #    A trade that reached this point passed the hard block in _low_price_fragile_gate,
+        #    but a low-price + dangerous-disagree combo in an extended slot is still fragile.
+        is_low_price = ctx.get("is_low_price_entry", False)
+        disagree_cls = ctx.get("disagree_classification", "actionable")
+        if is_low_price and disagree_cls == "dangerous":
+            return False, (
+                f"EXT_GATE low_price_dangerous_disagree "
+                f"(price<{LOW_PRICE_GATE_CENTS}¢ + disagree={disagree_cls})"
+            )
+
+        # 8. Weak temp_low in poorly calibrated city: calib_bias_level warn or penalty.
+        #    In an extended slot the bar is higher — we only want clean temp_low setups.
+        calib = ctx.get("calib_bias_level", "ok")
+        if rec.market_type == "temp_low" and calib in ("warn", "penalty"):
+            return False, f"EXT_GATE temp_low poor calibration (calib_bias_level={calib})"
+
+        return True, "EXT_GATE passed"
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main entry point
@@ -713,7 +952,14 @@ class TradeAnalysisEngine:
           2. Deduplicate to one trade per (city, market_type).
           3. Rank survivors by _conviction_score (multi-factor: edge, agreement,
              certainty, liquidity, confidence tier).
-          4. Cap at (MAX_TRADES_PER_DAY - trades_used); log skipped candidates.
+          4. Accept top EXTENDED_QUALITY_RANK_THRESHOLD candidates outright.
+          5. For ranks above EXTENDED_QUALITY_RANK_THRESHOLD (11–15), apply the
+             extended quality gate (_passes_extended_quality_gate) before accepting.
+          6. Cap total selections at (MAX_TRADES_PER_DAY - trades_used).
+
+        The daily cap (MAX_TRADES_PER_DAY) and the extended-gate threshold
+        (EXTENDED_QUALITY_RANK_THRESHOLD) are module-level constants and can be
+        tuned without touching this method.
         """
         trades_remaining = MAX_TRADES_PER_DAY - trades_used
         if trades_remaining <= 0:
@@ -752,38 +998,172 @@ class TradeAnalysisEngine:
             rec._conviction = self._conviction_score(rec)  # type: ignore[attr-defined]
         deduped.sort(key=lambda r: getattr(r, "_conviction", 0.0), reverse=True)
 
-        # Log full ranked candidate list
+        # Classify each candidate into a quality tier (top_tier / standard / marginal).
+        # Tier drives the size-uplift logic in _evaluate_market when the recommendation
+        # is finally executed.  Must happen after conviction scoring (tier uses the score).
+        for rec in deduped:
+            tier, tier_reasons = self._classify_trade_tier(rec)
+            rec.trade_tier = tier
+            rec.trade_tier_reasons = tier_reasons
+
+        # Log full ranked candidate list before selection pass
         logger.info(
             f"CANDIDATE_RANKING trades_used={trades_used} "
-            f"cap={MAX_TRADES_PER_DAY} candidates={len(deduped)}"
+            f"cap={MAX_TRADES_PER_DAY} ext_gate_after_rank={EXTENDED_QUALITY_RANK_THRESHOLD} "
+            f"candidates={len(deduped)} trades_remaining={trades_remaining} "
+            f"profile={op_profile.ACTIVE_PROFILE}"
         )
         for rank, rec in enumerate(deduped, start=1):
             score = getattr(rec, "_conviction", 0.0)
             ctx = rec.entry_context or {}
-            marker = "SELECT" if rank <= trades_remaining else "SKIP_CAP"
             agreement = ctx.get("signal_agreement", 0.5)
             uncertainty = ctx.get("model_uncertainty", rec.model_uncertainty)
             exec_liq = ctx.get("exec_liq", 0) or 0
+            in_ext_zone = rank > EXTENDED_QUALITY_RANK_THRESHOLD
+            zone_tag = "EXT" if in_ext_zone else "STD"
+            tier_tag = rec.trade_tier.upper()
             logger.info(
-                f"  RANK_{rank:02d} [{marker}] {rec.ticker} "
+                f"  RANK_{rank:02d} [{zone_tag}][{tier_tag}] {rec.ticker} "
                 f"conviction={score:.4f} edge={rec.edge:.3f} "
                 f"agreement={agreement:.2f} "
                 f"certainty={1.0 - uncertainty:.2f} "
                 f"liq=${exec_liq:.0f} "
                 f"confidence={rec.confidence} "
-                f"city={rec.city} type={rec.market_type}"
+                f"city={rec.city} type={rec.market_type} "
+                f"tier_reasons={rec.trade_tier_reasons}"
             )
 
-        selected = deduped[:trades_remaining]
-        skipped = deduped[trades_remaining:]
-        if skipped:
-            skipped_tickers = [r.ticker for r in skipped]
+        # Selection pass: accept candidates in rank order, applying extended
+        # quality gate to any trade beyond EXTENDED_QUALITY_RANK_THRESHOLD.
+        selected: list[TradeRecommendation] = []
+        skipped_cap: list[str] = []
+        skipped_ext: list[tuple[str, str]] = []  # (ticker, reason)
+
+        for rank, rec in enumerate(deduped, start=1):
+            if len(selected) >= trades_remaining:
+                # Daily cap exhausted — remaining candidates are cap-rejected.
+                skipped_cap.append(rec.ticker)
+                continue
+
+            if rank > EXTENDED_QUALITY_RANK_THRESHOLD:
+                # Extended quality gate applies to ranks 11–15.
+                passes, ext_reason = self._passes_extended_quality_gate(rec, selected)
+                if passes:
+                    logger.info(
+                        f"  RANK_{rank:02d} ACCEPT_EXT {rec.ticker} — {ext_reason}"
+                    )
+                    # Write final tier into entry_context so pnl.py can use it
+                    rec.entry_context["trade_tier"] = rec.trade_tier
+                    self._apply_tier_size_uplift(rec, daily_budget)
+                    selected.append(rec)
+                else:
+                    logger.info(
+                        f"  RANK_{rank:02d} REJECT_EXT {rec.ticker} — {ext_reason}"
+                    )
+                    skipped_ext.append((rec.ticker, ext_reason))
+            else:
+                # Standard slot (ranks 1–EXTENDED_QUALITY_RANK_THRESHOLD): accept outright.
+                rec.entry_context["trade_tier"] = rec.trade_tier
+                self._apply_tier_size_uplift(rec, daily_budget)
+                selected.append(rec)
+
+        # Summary log
+        top_tier_selected = [r for r in selected if r.trade_tier == "top_tier"]
+        logger.info(
+            f"SCAN_SELECTION_SUMMARY "
+            f"candidates={len(deduped)} "
+            f"selected={len(selected)} "
+            f"top_tier_selected={len(top_tier_selected)} "
+            f"rejected_ext_gate={len(skipped_ext)} "
+            f"rejected_cap={len(skipped_cap)} "
+            f"trades_used_after={trades_used + len(selected)}/{MAX_TRADES_PER_DAY} "
+            f"profile={op_profile.ACTIVE_PROFILE}"
+        )
+        for r in top_tier_selected:
             logger.info(
-                f"SKIPPED_BY_CAP {len(skipped)} candidates not executed "
-                f"(daily limit {MAX_TRADES_PER_DAY} trades): {skipped_tickers}"
+                f"  TOP_TIER_SELECTED {r.ticker} | "
+                f"contracts={r.contracts} cost=${r.cost_dollars:.2f} | "
+                f"reasons={r.trade_tier_reasons}"
+            )
+        if skipped_ext:
+            for ticker, reason in skipped_ext:
+                logger.info(f"  EXT_REJECTED {ticker}: {reason}")
+        if skipped_cap:
+            logger.info(
+                f"SKIPPED_BY_CAP {len(skipped_cap)} candidates not executed "
+                f"(daily limit {MAX_TRADES_PER_DAY} trades): {skipped_cap}"
             )
 
         return selected
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Top-tier size uplift
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _apply_tier_size_uplift(rec: "TradeRecommendation", daily_budget: float) -> None:
+        """
+        For top-tier trades, scale up contracts and cost_dollars by the profile
+        multiplier — subject to absolute caps.  Mutates rec in-place.
+
+        Caps enforced (same as _evaluate_market):
+          - position_dollars ≤ min(daily_budget * MAX_POSITION_PCT, MAX_DOLLARS_PER_TRADE)
+          - contracts ≥ 1
+
+        This is intentionally called *after* tier classification (which requires
+        the conviction score) and *after* the extended quality gate (so uplifted
+        sizes don't enter the gate calculation).
+        """
+        if rec.trade_tier != "top_tier":
+            return  # no uplift for standard / marginal
+
+        multiplier = op_profile.get_param("top_tier_size_multiplier")
+        if multiplier <= 1.0:
+            return  # profile says no uplift (e.g. protection_first)
+
+        price = rec.market_price
+        if price <= 0 or price >= 100:
+            return
+
+        # Recompute target dollars with uplift
+        old_cost = rec.cost_dollars
+        target_dollars = old_cost * multiplier
+
+        # Enforce absolute caps
+        max_position = min(daily_budget * MAX_POSITION_PCT, MAX_DOLLARS_PER_TRADE)
+        target_dollars = min(target_dollars, max_position)
+
+        # Convert to contracts (floor) and recompute actual cost
+        price_per_contract = price / 100.0
+        new_contracts = math.floor(target_dollars / price_per_contract)
+        if new_contracts <= rec.contracts:
+            # Uplift didn't add even one extra contract — log and skip
+            logger.debug(
+                f"TIER_UPLIFT_NOOP {rec.ticker}: multiplier={multiplier:.2f} "
+                f"would not add a contract (price={price}¢ old={rec.contracts} → new={new_contracts})"
+            )
+            return
+
+        new_cost = round(new_contracts * price_per_contract, 2)
+
+        old_contracts = rec.contracts
+        logger.info(
+            f"TIER_UPLIFT {rec.ticker} [{rec.trade_tier.upper()}] | "
+            f"profile={op_profile.ACTIVE_PROFILE} multiplier={multiplier:.2f} | "
+            f"contracts {old_contracts} → {new_contracts} "
+            f"cost ${old_cost:.2f} → ${new_cost:.2f} | "
+            f"price={price}¢ max_allowed=${max_position:.2f} | "
+            f"reasons={rec.trade_tier_reasons}"
+        )
+
+        rec.contracts = new_contracts
+        rec.cost_dollars = new_cost
+        # Update entry_context so the recorded snapshot reflects the actual size
+        rec.entry_context["tier_size_multiplier_applied"] = round(multiplier, 3)
+        rec.entry_context["tier_size_old_contracts"] = old_contracts
+        rec.entry_context["tier_size_old_cost"] = old_cost
+        rec.entry_context["tier_size_new_contracts"] = new_contracts
+        rec.entry_context["tier_size_new_cost"] = new_cost
 
     # ─────────────────────────────────────────────────────────────────────────
     # Market evaluation
@@ -1394,9 +1774,11 @@ class TradeAnalysisEngine:
             f"{sizing_note}"
         )
 
+        _tradable_edge_cents = _tb_info["tradable_edge_cents"]
         logger.info(
             f"TRADE_SIGNAL {ticker} | city={city} type={market_type} threshold={threshold} | "
-            f"side={side} price={price}¢ edge={edge:.3f} | "
+            f"side={side} price={price}¢ edge={edge:.3f} "
+            f"tradable_edge={_tradable_edge_cents:.1f}¢ trim_zone={_tb_zone} | "
             f"base_prob={base_prob:.3f} signal_adj={adj:+.3f} final_prob={our_prob:.3f} | "
             f"sigma={sigma:.1f}°F active_signals={agg.active_signals} "
             f"agreement={agg.signal_agreement:.0%} | "
@@ -1486,6 +1868,10 @@ class TradeAnalysisEngine:
             "signal_breakdown":    signal_breakdown,
             "trim_band_zone":      _tb_zone,
             "tradable_edge_cents": _tb_info["tradable_edge_cents"],
+            # ── Trade tier (assigned in get_recommendations after scoring) ────
+            # Populated to "standard" here; overwritten by get_recommendations
+            # once tier classification runs across all ranked candidates.
+            "trade_tier":          "standard",
         }
 
         return TradeRecommendation(

@@ -19,6 +19,7 @@ from datetime import date, datetime, timezone
 from typing import Optional
 
 from src.analysis.engine import SERIES_CITY_MAP
+from src.analysis import operating_profile as op_profile
 
 logger = logging.getLogger(__name__)
 
@@ -543,6 +544,8 @@ class Position:
     entry_liquidity_dollars: Optional[float] = None  # executable liquidity at entry
     # ── Fragile-trade flags ───────────────────────────────────────────────────
     fragile_flags: list = field(default_factory=list)  # e.g. ["low_price_entry"]
+    # ── Quality tier (from engine ranking) ───────────────────────────────────
+    trade_tier: str = "standard"   # "top_tier" / "standard" / "marginal"
     # ── Cached market metadata ────────────────────────────────────────────────
     close_time: Optional[str] = None  # cached from Kalshi API; avoids repeated calls every 5 min
 
@@ -1065,20 +1068,43 @@ class PnLTracker:
             # buffer, so on a fresh position exit_ev trivially exceeds hold_ev
             # even though we entered because our estimated prob is higher than
             # the market's.  Emergency exits (1–4 and 6) are NOT gated.
+            #
+            # Quality-based tolerance: top-tier positions receive additional
+            # grace time (profile-driven) before a fair-value exit can fire.
+            # This avoids exiting strong, well-supported positions that are
+            # simply waiting for the market to reprice toward our estimate.
             _fv_grace_ok = True
             if exit_contracts == 0 and exit_ev_adj >= hold_ev and state not in (STATE_LOCKED,):
+                # Determine effective grace period
+                _fv_hq, _fv_hq_reason = self._is_high_quality_hold(pos, state, hours_left)
+                _fv_quality_bonus = (
+                    op_profile.get_param("quality_fv_grace_minutes_bonus")
+                    if _fv_hq else 0
+                )
+                _effective_grace = FAIR_VALUE_GRACE_MINUTES + _fv_quality_bonus
+
                 if pos.placed_at:
                     try:
                         placed_dt = datetime.fromisoformat(pos.placed_at.replace("Z", "+00:00"))
-                        age_minutes = (datetime.now(timezone.utc) - placed_dt).total_seconds() / 60
-                        if age_minutes < FAIR_VALUE_GRACE_MINUTES:
+                        age_minutes_fv = (datetime.now(timezone.utc) - placed_dt).total_seconds() / 60
+                        if age_minutes_fv < _effective_grace:
                             _fv_grace_ok = False
-                            logger.info(
-                                f"FV_GRACE {pos.ticker}: suppressing fair-value exit — "
-                                f"position is only {age_minutes:.0f}min old "
-                                f"(grace={FAIR_VALUE_GRACE_MINUTES}min) "
-                                f"exit_ev={exit_ev_adj:.1f}¢ hold_ev={hold_ev:.1f}¢"
-                            )
+                            if _fv_quality_bonus > 0:
+                                logger.info(
+                                    f"FV_QUALITY_GRACE {pos.ticker}: suppressing fair-value exit — "
+                                    f"high_quality_hold=True grace={_effective_grace}min "
+                                    f"(base={FAIR_VALUE_GRACE_MINUTES} bonus=+{_fv_quality_bonus}) "
+                                    f"age={age_minutes_fv:.0f}min "
+                                    f"exit_ev={exit_ev_adj:.1f}¢ hold_ev={hold_ev:.1f}¢ | "
+                                    f"reason={_fv_hq_reason}"
+                                )
+                            else:
+                                logger.info(
+                                    f"FV_GRACE {pos.ticker}: suppressing fair-value exit — "
+                                    f"position is only {age_minutes_fv:.0f}min old "
+                                    f"(grace={_effective_grace}min) "
+                                    f"exit_ev={exit_ev_adj:.1f}¢ hold_ev={hold_ev:.1f}¢"
+                                )
                     except Exception:
                         pass  # parse failure → allow exit (safe default)
                 if _fv_grace_ok:
@@ -1087,15 +1113,28 @@ class PnLTracker:
 
             # ── Priority 6: Capital-trap / stalled exit ────────────────────────
             # Triggered when a position has been flagged as urgently stalled for
-            # >= STALL_ESCALATION_CYCLES consecutive balance-refresh cycles.
+            # >= effective_escalation_threshold consecutive balance-refresh cycles.
             # Bypasses the fair-value grace period intentionally: a stalled position
             # that has been stuck for many cycles with poor EV should be exited even
             # if it is still young (entry price may already be above fair value).
             # Only fires if there is a real exit price available (mark > 0 is already
             # confirmed above) and the position has an exit EV above a minimal floor.
+            #
+            # Quality-based holding tolerance: top-tier positions with a strong thesis
+            # receive extra stall cycles (profile-driven) before forced exit, so the
+            # bot doesn't prematurely close strong positions that are just quiet.
             if exit_contracts == 0:
                 stall_cycles = self.state.stall_alert_counts.get(pos.ticker, 0)
-                if stall_cycles >= STALL_ESCALATION_CYCLES:
+                # Compute effective escalation threshold (quality bonus applied here too)
+                _hq_for_stall, _hq_stall_reason = self._is_high_quality_hold(
+                    pos, state, hours_left
+                )
+                _quality_bonus = (
+                    op_profile.get_param("quality_stall_cycle_bonus")
+                    if _hq_for_stall else 0
+                )
+                _eff_esc_threshold = STALL_ESCALATION_CYCLES + _quality_bonus
+                if stall_cycles >= _eff_esc_threshold:
                     _stall_exit_ev = mark - SLIPPAGE_CENTS - FEE_CENTS
                     # Require a meaningful mark price (≥ STALL_EXIT_MIN_MARK_CENTS) so we
                     # don't force-exit a position that is still trading at a non-trivial
@@ -1105,9 +1144,18 @@ class PnLTracker:
                         exit_reason = EXIT_STALLED
                         logger.warning(
                             f"STALL_EXIT_TRIGGER {pos.ticker} {pos.side.upper()} | "
-                            f"stall_cycles={stall_cycles} >= {STALL_ESCALATION_CYCLES} | "
+                            f"stall_cycles={stall_cycles} >= eff_threshold={_eff_esc_threshold} "
+                            f"(base={STALL_ESCALATION_CYCLES} quality_bonus=+{_quality_bonus} "
+                            f"hq={_hq_for_stall} reason={_hq_stall_reason}) | "
                             f"mark={mark}¢ exit_ev={_stall_exit_ev:.1f}¢ — forcing exit"
                         )
+                elif _quality_bonus > 0 and stall_cycles > 0:
+                    logger.info(
+                        f"STALL_QUALITY_HOLD_ACTIVE {pos.ticker} {pos.side.upper()} | "
+                        f"stall_cycles={stall_cycles} < eff_threshold={_eff_esc_threshold} "
+                        f"(quality_bonus=+{_quality_bonus}) — holding strong position | "
+                        f"reason={_hq_stall_reason}"
+                    )
 
             # ── Priority 7: Salvage stop (fail-safe) ─────────────────────────
             if exit_contracts == 0:
@@ -1221,6 +1269,69 @@ class PnLTracker:
             "flags": flags,
         }
 
+    # ── High-quality hold assessment ──────────────────────────────────────────
+
+    @staticmethod
+    def _is_high_quality_hold(pos, state: str, hours_left: Optional[float]) -> tuple[bool, str]:
+        """
+        Returns (is_high_quality, reason_string).
+
+        A position is considered "high quality" for holding purposes when it
+        meets ALL of:
+          1. Classified top_tier at entry
+          2. Not in STATE_BROKEN or STATE_STALLED
+          3. Strong initial edge at entry (entry_edge >= 0.12, i.e. ≥12¢)
+          4. Low model uncertainty at entry (< 0.50)
+          5. Decent liquidity at entry ($30+)
+          6. No fragile flags (low-price, dangerous disagree, etc.)
+
+        Additionally, near_locked state is always treated as high-quality to
+        avoid unnecessary reduction of positions that are working well.
+
+        Used to apply profile-driven extra stall cycles and fair-value grace
+        time before forcing out positions that still have genuine path potential.
+
+        Hard vetoes that immediately return False:
+          - STATE_BROKEN (thesis invalidated — don't extend hold)
+          - Any fragile flag present (fragile trades are not high-quality holds)
+        """
+        # Hard veto: broken positions must exit regardless of quality
+        if state == STATE_BROKEN:
+            return False, "state=broken"
+
+        # near_locked is always considered high quality — it's working
+        if state == STATE_NEAR_LOCKED:
+            return True, "state=near_locked"
+
+        # Must be a top_tier trade
+        if getattr(pos, "trade_tier", "standard") != "top_tier":
+            return False, f"trade_tier={getattr(pos, 'trade_tier', 'standard')}"
+
+        # Fragile-flag veto: low-price or disagreement entries are not held longer
+        fragile = getattr(pos, "fragile_flags", []) or []
+        if fragile:
+            return False, f"fragile_flags={fragile}"
+
+        # Strong entry edge
+        entry_edge = getattr(pos, "entry_edge", None)
+        if entry_edge is None or entry_edge < 0.12:
+            return False, f"entry_edge={entry_edge} < 0.12"
+
+        # Low model uncertainty
+        model_unc = getattr(pos, "model_uncertainty", 0.5)
+        if model_unc >= 0.50:
+            return False, f"model_uncertainty={model_unc:.2f} >= 0.50"
+
+        # Decent entry liquidity
+        entry_liq = getattr(pos, "entry_liquidity_dollars", None)
+        if entry_liq is not None and entry_liq < 30.0:
+            return False, f"entry_liq=${entry_liq:.0f} < $30"
+
+        return True, (
+            f"top_tier entry_edge={entry_edge:.3f} "
+            f"unc={model_unc:.2f} liq=${entry_liq or 0:.0f}"
+        )
+
     # ── Stalled / capital-trap classification ─────────────────────────────────
 
     def classify_stalled_positions(self) -> list[dict]:
@@ -1306,6 +1417,14 @@ class PnLTracker:
                 self.state.stall_alert_counts.pop(pos.ticker, None)
                 continue
 
+            # ── Quality-based stall assessment ────────────────────────────────
+            # Pre-check quality before scoring stall flags: high-quality positions
+            # get a slightly lower effective hold-EV ceiling (harder to trigger the
+            # weak_hold_ev flag) in addition to the extra escalation cycle bonus.
+            _stall_hq, _stall_hq_reason = self._is_high_quality_hold(pos, state, hours_left)
+            _ev_bonus = op_profile.get_param("quality_stall_hold_ev_bonus_cents") if _stall_hq else 0.0
+            _effective_hold_ev_ceiling = STALL_HOLD_EV_CEILING - _ev_bonus  # lower = harder to flag
+
             # ── Stall flag scoring ────────────────────────────────────────────
             stall_flags = []
 
@@ -1313,7 +1432,7 @@ class PnLTracker:
             # With >STALL_HOLD_EV_HOURS_THRESHOLD hours left, a mid-range hold EV
             # (e.g. 44¢) simply means the market hasn't moved yet — not a trap.
             if (hours_left is None or hours_left < STALL_HOLD_EV_HOURS_THRESHOLD) and \
-                    hold_ev < STALL_HOLD_EV_CEILING:
+                    hold_ev < _effective_hold_ev_ceiling:
                 _hrs_str = f"{hours_left:.1f}" if hours_left is not None else "N/A"
                 stall_flags.append(f"weak_hold_ev({hold_ev:.1f}¢,{_hrs_str}h_left)")
 
@@ -1353,8 +1472,28 @@ class PnLTracker:
             stall_cycle = prev_count + 1
             self.state.stall_alert_counts[pos.ticker] = stall_cycle
 
+            # ── Quality-based holding tolerance ───────────────────────────────
+            # High-quality positions get extra stall cycles before being treated
+            # as urgent.  This prevents the bot from forcing out strong positions
+            # that happen to be quiet but still have real path potential.
+            # The bonus is profile-driven (0 for protection_first, 1+ for others).
+            is_high_quality_hold, hq_reason = self._is_high_quality_hold(
+                pos, state, hours_left
+            )
+            quality_cycle_bonus = 0
+            if is_high_quality_hold:
+                quality_cycle_bonus = op_profile.get_param("quality_stall_cycle_bonus")
+                if quality_cycle_bonus > 0:
+                    logger.info(
+                        f"STALL_QUALITY_HOLD {pos.ticker} {pos.side.upper()} | "
+                        f"high_quality_hold=True cycle_bonus=+{quality_cycle_bonus} | "
+                        f"reason={hq_reason} profile={op_profile.ACTIVE_PROFILE}"
+                    )
+
+            effective_escalation_threshold = STALL_ESCALATION_CYCLES + quality_cycle_bonus
+
             # ── Determine action — escalate after repeated cycles ─────────────
-            is_urgent = stall_cycle >= STALL_ESCALATION_CYCLES
+            is_urgent = stall_cycle >= effective_escalation_threshold
             if exitability["score"] >= 50 and exit_ev > 5:
                 action = "escalate_fair_value_exit"
             elif exitability["score"] >= 20 and exit_ev > 2:
@@ -1392,11 +1531,15 @@ class PnLTracker:
                 "stall_cycle": stall_cycle,
                 "is_urgent": is_urgent,
                 "should_alert": should_alert,
+                "is_high_quality_hold": is_high_quality_hold,
+                "quality_cycle_bonus": quality_cycle_bonus,
+                "effective_escalation_threshold": effective_escalation_threshold,
             }
 
             logger.warning(
                 f"STALLED_POSITION {pos.ticker} {pos.side.upper()} "
-                f"[cycle={stall_cycle}{'★URGENT' if is_urgent else ''}] | "
+                f"[cycle={stall_cycle}{'★URGENT' if is_urgent else ''}] "
+                f"[hq={is_high_quality_hold} bonus=+{quality_cycle_bonus} esc_at={effective_escalation_threshold}] | "
                 f"age={age_minutes:.0f}min mark={mark}¢ state={state} "
                 f"hrs_left={f'{hours_left:.1f}' if hours_left is not None else 'N/A'} | "
                 f"hold_ev={hold_ev:.1f}¢ exit_ev={exit_ev:.1f}¢ "
@@ -1482,6 +1625,7 @@ class PnLTracker:
             entry_weights_version=ctx.get("weights_version", ""),
             entry_liquidity_dollars=ctx.get("exec_liq"),
             fragile_flags=fragile_flags,
+            trade_tier=ctx.get("trade_tier", "standard"),
         )
         self.state.positions.append(pos)
         self.state.trades_placed += 1

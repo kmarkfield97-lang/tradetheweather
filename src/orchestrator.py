@@ -23,7 +23,7 @@ from src.tracker.history import DailyHistoryTracker, _get_season_for_date
 logger = logging.getLogger(__name__)
 
 SCAN_INTERVAL_MINUTES = 10
-MAX_TRADES_PER_DAY = 10  # hard cap: top 10 highest-conviction trades per day
+MAX_TRADES_PER_DAY = 15  # hard cap: top 15 highest-conviction trades per day
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "../data")
 

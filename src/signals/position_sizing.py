@@ -2,7 +2,15 @@
 Position sizing signal / calculator.
 Returns a recommended position size in dollars using fractional Kelly criterion,
 adjusted for signal agreement, model uncertainty, and liquidity.
+
+For top-tier trades (trade_tier="top_tier") a modest size multiplier is applied
+on top of the baseline before the absolute position caps are enforced.  The
+multiplier comes from the active operating profile so it can be tuned without
+code changes.  All absolute caps (max 20% of daily budget, MAX_DOLLARS_PER_TRADE)
+are enforced *after* the multiplier, ensuring the uplift cannot exceed safe limits.
 """
+
+from src.analysis import operating_profile as op_profile
 
 
 def compute(
@@ -15,11 +23,13 @@ def compute(
     signal_agreement: float,  # 0-1
     model_uncertainty: float, # 0-1, higher = less certain
     liquidity: dict,
+    trade_tier: str = "standard",   # "top_tier" / "standard" / "marginal"
 ) -> dict:
     """
     Returns a dict with keys:
         position_dollars, kelly_raw, fractional_kelly,
-        confidence_multiplier, liquidity_multiplier, exposure_multiplier
+        confidence_multiplier, liquidity_multiplier, exposure_multiplier,
+        tier_multiplier, trade_tier
     """
     # Basic Kelly criterion
     prob_win = our_prob if side == "yes" else (1.0 - our_prob)
@@ -33,6 +43,8 @@ def compute(
             "confidence_multiplier": 0.0,
             "liquidity_multiplier": 0.0,
             "exposure_multiplier": 0.0,
+            "tier_multiplier": 1.0,
+            "trade_tier": trade_tier,
         }
 
     odds = (100 - price) / price   # net payout per dollar if we win
@@ -72,6 +84,16 @@ def compute(
         * uncertainty_penalty
     )
 
+    # ── Top-tier size uplift ───────────────────────────────────────────────────
+    # Only applied when the trade is classified top_tier AND the active operating
+    # profile specifies a multiplier > 1.0.  The caps below remain unchanged so
+    # the uplift can never bypass the absolute position-size limits.
+    tier_multiplier = 1.0
+    if trade_tier == "top_tier":
+        tier_multiplier = op_profile.get_param("top_tier_size_multiplier")
+        if tier_multiplier != 1.0:
+            position_dollars *= tier_multiplier
+
     # Caps: maximum 20% of daily budget.
     # Minimum is relative to account size (1% of budget, floor $0.10) to avoid
     # overriding Kelly on small accounts with a fixed-dollar floor.
@@ -87,4 +109,6 @@ def compute(
         "confidence_multiplier": round(confidence_multiplier, 3),
         "liquidity_multiplier": round(liquidity_multiplier, 3),
         "exposure_multiplier": round(exposure_multiplier, 3),
+        "tier_multiplier": round(tier_multiplier, 3),
+        "trade_tier": trade_tier,
     }
