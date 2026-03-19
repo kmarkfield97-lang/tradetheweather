@@ -129,6 +129,9 @@ class RootCauseTags:
     halt_side_effects: bool = False    # daily brake forced an exit at bad price
     normal_variance: bool = False      # outcome within expected range for this sigma
     insufficient_telemetry: bool = False  # no entry snapshot stored — can't diagnose
+    # ── Disagree-quality tags ────────────────────────────────────────────────
+    low_price_dangerous_disagree: bool = False  # low-price + dangerous disagreement
+    dangerous_disagree_market_right: bool = False  # disagreement classified dangerous & mkt won
 
     def to_dict(self) -> dict:
         return {
@@ -153,6 +156,8 @@ class RootCauseTags:
             "halt_side_effects": self.halt_side_effects,
             "normal_variance": self.normal_variance,
             "insufficient_telemetry": self.insufficient_telemetry,
+            "low_price_dangerous_disagree": self.low_price_dangerous_disagree,
+            "dangerous_disagree_market_right": self.dangerous_disagree_market_right,
         }
 
 
@@ -452,6 +457,16 @@ def derive_structured_lesson(position: dict) -> StructuredLesson:
     fragile_flags     = list(position.get("fragile_flags", []) or [])
     has_snapshot      = entry_our_prob is not None
 
+    # ── Entry context (rich snapshot stored since recent logging improvements) ──
+    entry_ctx         = position.get("entry_context") or {}
+    ec_mip_verdict    = entry_ctx.get("mip_verdict", "NONE")
+    ec_disagree_class = entry_ctx.get("disagree_classification", "actionable")
+    ec_raw_disagree   = float(entry_ctx.get("raw_disagreement", 0.0))
+    ec_is_low_price   = bool(entry_ctx.get("is_low_price_entry", False))
+    ec_calib_level    = entry_ctx.get("calib_bias_level", "ok")
+    ec_sigma          = float(entry_ctx.get("sigma_f", entry_sigma or 7.0))
+    ec_signal_agree   = float(entry_ctx.get("signal_agreement", 0.5))
+
     # Normalised exit reason category (stable string)
     exit_reason_cat = _categorize_exit_reason_lesson(exit_reason_raw)
 
@@ -510,12 +525,32 @@ def derive_structured_lesson(position: dict) -> StructuredLesson:
 
     # ── Fragile-trade tags → root cause hints ────────────────────────────────
     if "low_price_entry" in fragile_flags and outcome == "loss":
-        # Low-price contracts have high delta variance — often unavoidable
-        tags.normal_variance = True
+        # Low-price contracts have high delta variance — default to normal variance
+        # UNLESS the entry had dangerous disagreement, in which case it's a model error.
+        if ec_is_low_price and ec_disagree_class == "dangerous" and ec_raw_disagree > 0.20:
+            tags.model_error = True
+            tags.low_price_dangerous_disagree = True
+            tags.should_not_have_traded = True
+            # The market was right: disagreement was classified as dangerous but we traded
+            if outcome == "loss":
+                tags.dangerous_disagree_market_right = True
+        else:
+            tags.normal_variance = True
     if "same_day_entry" in fragile_flags and outcome == "loss":
         tags.late_day_path_failure = True
     if "model_market_disagreement" in fragile_flags:
         tags.should_not_have_traded = True
+
+    # ── Entry context disagree tags (from rich entry_context, independent of fragile_flags) ──
+    if ec_disagree_class == "dangerous" and ec_raw_disagree > 0.20 and outcome == "loss":
+        tags.model_error = True
+        tags.low_price_dangerous_disagree = ec_is_low_price
+        tags.dangerous_disagree_market_right = True
+        tags.should_not_have_traded = True
+
+    # ── Poor calibration tag ───────────────────────────────────────────────────
+    if ec_calib_level in ("warn", "penalty") and market_type == "temp_low" and outcome == "loss":
+        tags.forecast_error_driver = True
 
     # ── Telemetry gap flag ───────────────────────────────────────────────────
     if not has_snapshot:
@@ -599,6 +634,16 @@ def derive_structured_lesson(position: dict) -> StructuredLesson:
         has_snapshot=has_snapshot,
         entry_edge=entry_edge,
         entry_hours_left=entry_hours_left,
+        # Rich entry context
+        ec_mip_verdict=ec_mip_verdict,
+        ec_disagree_class=ec_disagree_class,
+        ec_raw_disagree=ec_raw_disagree,
+        ec_is_low_price=ec_is_low_price,
+        ec_calib_level=ec_calib_level,
+        ec_sigma=ec_sigma,
+        ec_signal_agree=ec_signal_agree,
+        city=city,
+        market_type=market_type,
     )
 
     confidence = 0.1 if outcome == "scratch" else 0.3
@@ -674,10 +719,13 @@ def _derive_primary_root_cause(tags: RootCauseTags, outcome: str) -> str:
     """
     if tags.execution_issue or tags.stale_data_issue:
         return "execution_issue"
-    if tags.insufficient_telemetry:
-        return "insufficient_telemetry"
     if tags.halt_side_effects:
         return "halt_side_effects"
+    # Specific disagree pattern takes priority over generic insufficient_telemetry
+    if tags.dangerous_disagree_market_right:
+        return "low_price_dangerous_disagree" if tags.low_price_dangerous_disagree else "dangerous_disagree"
+    if tags.insufficient_telemetry:
+        return "insufficient_telemetry"
     if tags.model_error:
         return "model_error"
     if tags.forecast_error_driver:
@@ -710,6 +758,16 @@ def _build_lesson_text(
     has_snapshot: bool,
     entry_edge: Optional[float],
     entry_hours_left: Optional[float],
+    # Rich entry context (optional, defaults for backward compat)
+    ec_mip_verdict: str = "NONE",
+    ec_disagree_class: str = "actionable",
+    ec_raw_disagree: float = 0.0,
+    ec_is_low_price: bool = False,
+    ec_calib_level: str = "ok",
+    ec_sigma: float = 7.0,
+    ec_signal_agree: float = 0.5,
+    city: str = "",
+    market_type: str = "",
 ) -> str:
     """Builds a human-readable lesson string that reflects the three-class outcome."""
     edge_str = f" edge={entry_edge*100:.1f}¢" if entry_edge is not None else ""
@@ -747,9 +805,53 @@ def _build_lesson_text(
             f"Action: {action}."
         )
 
-    # Loss
+    # ── Loss — attempt to produce the most specific pattern string available ──
     decomp_dict = decomp.to_dict()
     primary_driver = max(decomp_dict, key=lambda k: decomp_dict[k])
+
+    # Pattern 1: low-price + dangerous disagreement — the most actionable pattern
+    if tags.low_price_dangerous_disagree or tags.dangerous_disagree_market_right:
+        disagree_pct = f"{ec_raw_disagree:.0%}" if ec_raw_disagree else "large"
+        calib_note = (
+            f" Calibration penalty active ({ec_calib_level})."
+            if ec_calib_level in ("warn", "penalty") else ""
+        )
+        return (
+            f"LOSS [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
+            f"exit={exit_p}¢ pnl=${pnl:+.2f}{edge_str}{hours_str}{excursion_str}"
+            f"{fragile_str}{telemetry_note}. "
+            f"PATTERN: low-price ({entry}¢) + dangerous model-vs-market disagreement "
+            f"({disagree_pct} gap, mip={ec_mip_verdict}, class={ec_disagree_class}). "
+            f"Market was right; model was too optimistic. "
+            f"sigma={ec_sigma:.1f}°F signal_agreement={ec_signal_agree:.0%}.{calib_note} "
+            f"Low-price large-disagreement entries need stricter gating. "
+            f"Exit: {exit_reason_cat}. Action: {action}."
+        )
+
+    # Pattern 2: temp_low + poor calibration
+    if market_type == "temp_low" and ec_calib_level in ("warn", "penalty"):
+        return (
+            f"LOSS [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
+            f"exit={exit_p}¢ pnl=${pnl:+.2f}{edge_str}{hours_str}{excursion_str}"
+            f"{fragile_str}{telemetry_note}. "
+            f"PATTERN: temp_low trade with degraded calibration (level={ec_calib_level}). "
+            f"Forecast bias may not have been enforced strongly enough. "
+            f"sigma={ec_sigma:.1f}°F. "
+            f"Primary driver: {primary_driver}. Exit: {exit_reason_cat}. Action: {action}."
+        )
+
+    # Pattern 3: model error (general)
+    if tags.model_error and not tags.low_price_dangerous_disagree:
+        return (
+            f"LOSS [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
+            f"exit={exit_p}¢ pnl=${pnl:+.2f}{edge_str}{hours_str}{excursion_str}"
+            f"{fragile_str}{telemetry_note}. "
+            f"PATTERN: model directional error — position moved immediately adverse "
+            f"(MAE={mae_cents}¢ vs entry={entry}¢). "
+            f"Primary driver: {primary_driver}. Exit: {exit_reason_cat}. Action: {action}."
+        )
+
+    # Default: generic loss
     return (
         f"LOSS [{sev}]: {ticker} {side.upper()} entry={entry}¢ "
         f"exit={exit_p}¢ pnl=${pnl:+.2f}{edge_str}{hours_str}{excursion_str}"

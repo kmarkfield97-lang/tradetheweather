@@ -2,9 +2,23 @@
 Market implied probability signal.
 
 Computes the market-implied probability and diagnoses significant disagreement
-rather than just flagging it. Distinguishes between:
-  - Opportunity (our data is fresher or more precise than the market)
-  - Warning (market likely knows something we don't)
+rather than just flagging it.  Distinguishes between two conceptual categories:
+
+A. Likely-actionable disagreement (our data is fresher or more precise):
+     - Fresh forecast (<3h old)
+     - Orderbook neutral or skewed against market price
+     - Reasonable time remaining
+
+B. Dangerous disagreement (market is probably right, model is wrong):
+     - Stale forecast (>3h)
+     - Orderbook volume aligns with market (crowd agrees with market)
+     - Final window (<2h) with persistent disagreement
+     - Low-price contract + large disagreement (handled in engine gate)
+     - Extreme sigma / poor calibration (handled in engine gate)
+
+The engine's _classify_disagreement() method combines the MIP verdict with
+contract-level attributes (price, sigma, calib) to make the final actionable vs
+dangerous call.  This signal's job is to score the market-level signals only.
 
 Diagnosis checklist when disagreement > 0.20:
   1. Forecast recency — stale forecast makes market more likely correct
@@ -126,8 +140,9 @@ def compute(
 
     warn_str = ",".join(warning_flags) if warning_flags else "none"
     opp_str = ",".join(opportunity_flags) if opportunity_flags else "none"
+    # verdict is placed first so engine can find it with a simple prefix scan
     note = (
-        f"market_implied: {verdict} model={our_prob:.2f} market={market_prob:.2f} "
+        f"market_implied[{verdict}]: model={our_prob:.2f} market={market_prob:.2f} "
         f"(diff={disagreement:.2f}) | warn=[{warn_str}] opp=[{opp_str}] "
         f"→ adj={adj:+.3f} conf={confidence:.2f}"
     )
@@ -136,4 +151,8 @@ def compute(
         "prob_adjustment": round(adj, 4),
         "confidence": round(confidence, 3),
         "note": note,
+        # Surface verdict and raw disagreement as top-level fields so the engine
+        # can read them directly without parsing the note string.
+        "verdict": verdict,
+        "raw_disagreement": round(disagreement, 4),
     }

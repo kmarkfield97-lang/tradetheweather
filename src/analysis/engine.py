@@ -100,6 +100,42 @@ TEMP_LOW_PENALTY_EDGE_ADD    = 0.05  # extra edge required (cents as fraction) a
 TEMP_LOW_WARN_EDGE_ADD       = 0.03  # extra edge required at WARN level
 TEMP_LOW_BIAS_CORRECTION_FRAC = 0.5  # fraction of mean bias to subtract from forecast low
 
+# ── Low-price + large-disagreement combined gate ───────────────────────────────
+# A contract priced below LOW_PRICE_GATE_CENTS is "low-price fragile":
+#   - high delta variance → a 5¢ move is a 25%+ swing on a 20¢ contract
+#   - any disagreement with the market is amplified; errors compound quickly
+#
+# When the contract is also in large model-vs-market disagreement we treat the
+# combination as "dangerous disagreement" rather than "actionable opportunity"
+# UNLESS hard confirming evidence is present (see _classify_disagreement).
+#
+# LOW_PRICE_GATE_CENTS          : price threshold defining "low-price" (¢)
+# LOW_PRICE_LARGE_DISAGREE_EDGE : extra edge required when low-price + LARGE_OPP
+# LOW_PRICE_EXTREME_DISAGREE_EDGE: extra edge when low-price + EXTREME_OPP
+# LOW_PRICE_MAX_DISAGREEMENT    : hard block if disagreement > this and no
+#                                 confirming signals (danger zone)
+# LOW_PRICE_MIN_SIGNAL_AGREEMENT: minimum signal agreement required for a
+#                                 low-price + large-disagreement trade
+# LOW_PRICE_MAX_SIGMA_F         : maximum allowed sigma (°F) for low-price trades
+LOW_PRICE_GATE_CENTS            = 20    # contracts priced < 20¢ are "low-price fragile"
+LOW_PRICE_LARGE_DISAGREE_EDGE   = 0.10  # 10¢ extra above normal min_edge
+LOW_PRICE_EXTREME_DISAGREE_EDGE = 0.20  # 20¢ extra — nearly always rejects
+LOW_PRICE_MAX_DISAGREEMENT      = 0.35  # hard block above this if disagree=dangerous
+LOW_PRICE_MIN_SIGNAL_AGREEMENT  = 0.65  # need 65%+ signal alignment
+LOW_PRICE_MAX_SIGMA_F           = 10.0  # reject if model uncertainty > 10°F
+
+# ── Temp_low conservatism under poor calibration ──────────────────────────────
+# Beyond the per-level edge surcharges, apply additional gating when the
+# combination of calibration quality + sigma is extreme.
+#
+# TEMP_LOW_EXTREME_SIGMA_F      : sigma above this triggers an extra edge req
+# TEMP_LOW_EXTREME_SIGMA_EDGE   : extra edge added when sigma is extreme
+# TEMP_LOW_POOR_CALIB_MIN_EDGE  : hard minimum edge for any temp_low with warn+
+#                                 calibration (overrides the liquidity-tier minimum)
+TEMP_LOW_EXTREME_SIGMA_F        = 10.0  # °F
+TEMP_LOW_EXTREME_SIGMA_EDGE     = 0.05  # +5¢ extra when sigma > 10°F
+TEMP_LOW_POOR_CALIB_MIN_EDGE    = 0.12  # 12¢ minimum for warn/penalty temp_low
+
 # ── Monte Carlo settings ───────────────────────────────────────────────────────
 MC_PATHS = 2000             # number of simulated temperature paths
 
@@ -281,6 +317,169 @@ class TradeAnalysisEngine:
         """
         key = f"{city.upper()}:{market_type}"
         return self._uncertainty_cache.get(key, DEFAULT_UNCERTAINTY_F)
+
+    @staticmethod
+    def _classify_disagreement(
+        disagreement: float,
+        market_price_cents: int,
+        sigma_f: float,
+        signal_agreement: float,
+        mip_verdict: str,
+        bias_level: str,
+        market_type: str,
+        forecast_fresh: bool,
+    ) -> tuple[str, list[str]]:
+        """
+        Classifies a model-vs-market disagreement as either "actionable" or "dangerous".
+
+        Actionable disagreement = we likely have a real edge (market is behind our data).
+        Dangerous disagreement  = the market is probably right and our model is wrong.
+
+        Returns (classification, reasons) where classification is one of:
+          "actionable"  — proceed (subject to normal edge checks)
+          "dangerous"   — apply extra scrutiny / higher edge / hard block
+
+        Confirming signals required to call disagreement "actionable":
+          1. Fresh forecast (<3h old) — our data is likely newer than market
+          2. High signal agreement (≥65%) — multiple independent signals agree
+          3. Low uncertainty (sigma ≤ 10°F) — model is confident
+
+        Any of the following push toward "dangerous":
+          - Low-price contract (< 20¢)     — high delta variance amplifies errors
+          - Extreme sigma (> 10°F)         — model itself is very uncertain
+          - Poor calibration (warn+)       — historical forecast errors are severe
+          - Very large disagreement (>35%) — burden of proof is on our model
+        """
+        is_low_price = (market_price_cents < LOW_PRICE_GATE_CENTS)
+        is_extreme_sigma = (sigma_f > LOW_PRICE_MAX_SIGMA_F)
+        is_poor_calib = (bias_level in ("warn", "penalty", "block"))
+        is_very_large_disagree = (disagreement > 0.35)
+
+        danger_flags: list[str] = []
+        if is_low_price:
+            danger_flags.append(f"low_price({market_price_cents}¢)")
+        if is_extreme_sigma:
+            danger_flags.append(f"extreme_sigma({sigma_f:.1f}°F)")
+        if is_poor_calib:
+            danger_flags.append(f"poor_calib({bias_level})")
+        if is_very_large_disagree:
+            danger_flags.append(f"very_large_disagree({disagreement:.0%})")
+
+        # Confirming signals for "actionable".
+        # For a low-price trade, signal agreement is REQUIRED — it is not optional.
+        # Without strong signal alignment a low-price large-disagreement trade is too fragile.
+        confirm_count = 0
+        confirm_flags: list[str] = []
+        has_signal_agreement = (signal_agreement >= LOW_PRICE_MIN_SIGNAL_AGREEMENT)
+        if forecast_fresh:
+            confirm_count += 1
+            confirm_flags.append("fresh_forecast")
+        if has_signal_agreement:
+            confirm_count += 1
+            confirm_flags.append(f"signal_agreement({signal_agreement:.0%})")
+        if not is_extreme_sigma:
+            confirm_count += 1
+            confirm_flags.append(f"low_sigma({sigma_f:.1f}°F)")
+
+        # Classification rule:
+        #  - No danger flags → actionable
+        #  - Low-price or extreme-sigma danger: MUST have signal agreement + at least one other
+        #  - Other danger flags: need ≥2 confirms
+        n_danger = len(danger_flags)
+        if n_danger == 0:
+            classification = "actionable"
+            reasons = confirm_flags
+        elif is_low_price or is_extreme_sigma:
+            # Signal agreement is a hard requirement for low-price or extreme-sigma trades.
+            # When BOTH low-price AND extreme-sigma fire together, require all 3 confirms.
+            both_severe = is_low_price and is_extreme_sigma
+            required = 3 if both_severe else 2
+            if not has_signal_agreement:
+                classification = "dangerous"
+                reasons = danger_flags + [f"missing_signal_agreement({signal_agreement:.0%}<{LOW_PRICE_MIN_SIGNAL_AGREEMENT:.0%})"]
+            elif confirm_count >= required:
+                classification = "actionable"
+                reasons = confirm_flags + [f"danger_flags_cleared: {danger_flags}"]
+            else:
+                classification = "dangerous"
+                reasons = danger_flags + [f"only {confirm_count}/{required} confirms: {confirm_flags}"]
+        else:
+            required_confirms = min(n_danger, 3)
+            if confirm_count >= required_confirms:
+                classification = "actionable"
+                reasons = confirm_flags + [f"danger_flags_cleared: {danger_flags}"]
+            else:
+                classification = "dangerous"
+                reasons = danger_flags + [f"only {confirm_count}/{required_confirms} confirms: {confirm_flags}"]
+
+        return classification, reasons
+
+    def _low_price_fragile_gate(
+        self,
+        ticker: str,
+        price: int,
+        edge: float,
+        min_edge_req: float,
+        disagreement: float,
+        mip_verdict: str,
+        disagree_classification: str,
+        signal_agreement: float,
+        sigma_f: float,
+        market_type: str,
+        bias_level: str,
+    ) -> tuple[bool, float, str]:
+        """
+        Gate for low-price (< LOW_PRICE_GATE_CENTS) entries with large disagreement.
+
+        Returns (allow, new_min_edge_req, rejection_reason).
+        If allow=True, new_min_edge_req reflects any surcharge applied.
+        If allow=False, rejection_reason explains why.
+
+        This gate is only called when price < LOW_PRICE_GATE_CENTS.
+        It is a hard veto for genuinely dangerous combinations.
+        """
+        is_large_disagree = (mip_verdict in ("LARGE_OPP", "EXTREME_OPP"))
+        is_extreme_disagree = (mip_verdict == "EXTREME_OPP")
+
+        # Hard block: dangerous disagreement above the maximum allowed threshold
+        if (disagree_classification == "dangerous"
+                and disagreement > LOW_PRICE_MAX_DISAGREEMENT):
+            reason = (
+                f"LOW_PRICE_FRAGILE_BLOCK {ticker}: price={price}¢ < {LOW_PRICE_GATE_CENTS}¢ "
+                f"disagree={disagreement:.0%} > max={LOW_PRICE_MAX_DISAGREEMENT:.0%} "
+                f"classification=dangerous mip={mip_verdict} "
+                f"agreement={signal_agreement:.0%} sigma={sigma_f:.1f}°F calib={bias_level}"
+            )
+            return False, min_edge_req, reason
+
+        # Hard block: signal agreement too low for a low-price trade with disagreement
+        if (is_large_disagree and disagree_classification == "dangerous"
+                and signal_agreement < LOW_PRICE_MIN_SIGNAL_AGREEMENT):
+            reason = (
+                f"LOW_PRICE_FRAGILE_BLOCK {ticker}: price={price}¢ low_price+dangerous_disagree "
+                f"signal_agreement={signal_agreement:.0%} < min={LOW_PRICE_MIN_SIGNAL_AGREEMENT:.0%} "
+                f"mip={mip_verdict} disagree={disagreement:.0%}"
+            )
+            return False, min_edge_req, reason
+
+        # Hard block: extreme sigma on a low-price trade (model itself is deeply uncertain)
+        if sigma_f > LOW_PRICE_MAX_SIGMA_F and is_large_disagree:
+            reason = (
+                f"LOW_PRICE_FRAGILE_BLOCK {ticker}: price={price}¢ sigma={sigma_f:.1f}°F "
+                f"> max={LOW_PRICE_MAX_SIGMA_F}°F with mip={mip_verdict} disagree={disagreement:.0%}"
+            )
+            return False, min_edge_req, reason
+
+        # Edge surcharge: apply extra edge requirements for any low-price large-disagree combo
+        if is_extreme_disagree:
+            extra = LOW_PRICE_EXTREME_DISAGREE_EDGE
+        elif is_large_disagree:
+            extra = LOW_PRICE_LARGE_DISAGREE_EDGE
+        else:
+            extra = 0.0
+
+        new_min = min_edge_req + extra
+        return True, new_min, ""
 
     def _get_dynamic_sigma(
         self, city: str, market_type: str, hours_to_close: Optional[float]
@@ -847,6 +1046,8 @@ class TradeAnalysisEngine:
 
         # Market implied probability (extreme disagreement guard + diagnosis)
         extreme_disagreement = False
+        mip_verdict = "NONE"
+        raw_disagreement = 0.0
         try:
             mip_sig = market_implied_prob.compute(
                 liquidity, base_prob, side,
@@ -854,6 +1055,22 @@ class TradeAnalysisEngine:
                 hours_left=hours_left,
             )
             signal_inputs.append(mip_sig)
+            # Read verdict and raw_disagreement directly from the signal dict.
+            # Fall back to note-string parsing for compatibility with older versions.
+            if "verdict" in mip_sig:
+                mip_verdict = mip_sig["verdict"]
+            else:
+                mip_note = mip_sig.get("note", "")
+                for _v in ("EXTREME_WARN", "EXTREME_OPP", "LARGE_WARN", "LARGE_OPP"):
+                    if _v in mip_note:
+                        mip_verdict = _v
+                        break
+            if "raw_disagreement" in mip_sig:
+                raw_disagreement = mip_sig["raw_disagreement"]
+            else:
+                _best_yes = liquidity.get("best_yes_price")
+                if _best_yes is not None:
+                    raw_disagreement = abs(base_prob - _best_yes / 100.0)
             # Flag if extreme disagreement — will require wider edge
             if mip_sig.get("confidence", 1.0) <= 0.2:
                 extreme_disagreement = True
@@ -925,20 +1142,98 @@ class TradeAnalysisEngine:
                 )
 
         # Temp_low calibration edge surcharge (warn/penalty levels)
+        # Also enforce hard minimum and extreme-sigma penalty for poor calibration.
+        bias_level_for_gate = "ok"
         if market_type == "temp_low" and calibration:
-            bias_level, mean_bias, n_bias = self._get_temp_low_bias_status(city, calibration)
-            if bias_level == "penalty":
+            bias_level_for_gate, mean_bias, n_bias = self._get_temp_low_bias_status(city, calibration)
+            if bias_level_for_gate == "penalty":
                 min_edge_req += TEMP_LOW_PENALTY_EDGE_ADD
                 logger.info(
                     f"{ticker}: temp_low PENALTY edge surcharge +{TEMP_LOW_PENALTY_EDGE_ADD*100:.0f}¢ "
                     f"calib mean_err={mean_bias:+.1f}°F n={n_bias} → min_edge={min_edge_req:.3f}"
                 )
-            elif bias_level == "warn":
+            elif bias_level_for_gate == "warn":
                 min_edge_req += TEMP_LOW_WARN_EDGE_ADD
                 logger.info(
                     f"{ticker}: temp_low WARN edge surcharge +{TEMP_LOW_WARN_EDGE_ADD*100:.0f}¢ "
                     f"calib mean_err={mean_bias:+.1f}°F n={n_bias} → min_edge={min_edge_req:.3f}"
                 )
+
+            # Hard minimum for any temp_low with degraded calibration (warn or worse)
+            if bias_level_for_gate in ("warn", "penalty") and min_edge_req < TEMP_LOW_POOR_CALIB_MIN_EDGE:
+                logger.info(
+                    f"{ticker}: temp_low poor-calib hard min_edge floor "
+                    f"{min_edge_req:.3f} → {TEMP_LOW_POOR_CALIB_MIN_EDGE:.3f} "
+                    f"(calib={bias_level_for_gate})"
+                )
+                min_edge_req = TEMP_LOW_POOR_CALIB_MIN_EDGE
+
+            # Extra surcharge when sigma is extreme (model is deeply uncertain)
+            if sigma > TEMP_LOW_EXTREME_SIGMA_F:
+                min_edge_req += TEMP_LOW_EXTREME_SIGMA_EDGE
+                logger.info(
+                    f"{ticker}: temp_low extreme sigma surcharge +{TEMP_LOW_EXTREME_SIGMA_EDGE*100:.0f}¢ "
+                    f"sigma={sigma:.1f}°F > {TEMP_LOW_EXTREME_SIGMA_F}°F → min_edge={min_edge_req:.3f}"
+                )
+
+        # ── Low-price + large-disagreement combined gate ───────────────────────
+        # Determine whether forecast is fresh (for disagree classification)
+        _forecast_fresh = False
+        _fc_generated = report.get("forecast", {}).get("generated_at")
+        if _fc_generated:
+            try:
+                _fc_dt = datetime.fromisoformat(_fc_generated.replace("Z", "+00:00"))
+                _fc_age_h = (datetime.now(timezone.utc) - _fc_dt).total_seconds() / 3600
+                _forecast_fresh = (_fc_age_h < 3.0)
+            except Exception:
+                pass
+
+        disagree_classification = "actionable"
+        disagree_reasons: list[str] = []
+        is_low_price_entry = (price < LOW_PRICE_GATE_CENTS)
+
+        if mip_verdict in ("LARGE_OPP", "EXTREME_OPP", "LARGE_WARN", "EXTREME_WARN"):
+            disagree_classification, disagree_reasons = self._classify_disagreement(
+                disagreement=raw_disagreement,
+                market_price_cents=price,
+                sigma_f=sigma,
+                signal_agreement=agg.signal_agreement,
+                mip_verdict=mip_verdict,
+                bias_level=bias_level_for_gate,
+                market_type=market_type,
+                forecast_fresh=_forecast_fresh,
+            )
+            logger.info(
+                f"{ticker}: disagree_classify={disagree_classification} "
+                f"mip={mip_verdict} disagree={raw_disagreement:.0%} "
+                f"price={price}¢ sigma={sigma:.1f}°F "
+                f"agreement={agg.signal_agreement:.0%} fresh_fc={_forecast_fresh} "
+                f"reasons={disagree_reasons}"
+            )
+
+        # Low-price fragile gate (only applies when price < LOW_PRICE_GATE_CENTS)
+        if is_low_price_entry:
+            _lp_allow, min_edge_req, _lp_reason = self._low_price_fragile_gate(
+                ticker=ticker,
+                price=price,
+                edge=edge,
+                min_edge_req=min_edge_req,
+                disagreement=raw_disagreement,
+                mip_verdict=mip_verdict,
+                disagree_classification=disagree_classification,
+                signal_agreement=agg.signal_agreement,
+                sigma_f=sigma,
+                market_type=market_type,
+                bias_level=bias_level_for_gate,
+            )
+            if not _lp_allow:
+                logger.warning(_lp_reason)
+                self._record_missed_opportunity(
+                    ticker=ticker, city=city, market_type=market_type,
+                    rejection_reason="low_price_fragile_block",
+                    our_prob=our_prob, market_price_cents=price, edge_cents=edge * 100,
+                )
+                return None
 
         if edge < min_edge_req:
             gap = min_edge_req - edge
@@ -1105,9 +1400,27 @@ class TradeAnalysisEngine:
             f"base_prob={base_prob:.3f} signal_adj={adj:+.3f} final_prob={our_prob:.3f} | "
             f"sigma={sigma:.1f}°F active_signals={agg.active_signals} "
             f"agreement={agg.signal_agreement:.0%} | "
+            f"mip={mip_verdict} disagree={raw_disagreement:.0%} "
+            f"disagree_class={disagree_classification} "
+            f"low_price={is_low_price_entry} | "
             f"contracts={contracts} cost=${actual_cost:.2f} confidence={confidence} | "
             f"weights_ver={agg.weights_version} signals={signal_notes}"
         )
+
+        # ── Low-price diagnostic snapshot (logged for every accepted low-price entry) ──
+        if is_low_price_entry:
+            _mkt_implied_prob = liquidity.get("best_yes_price")
+            _mkt_implied_str = f"{_mkt_implied_prob / 100.0:.4f}" if _mkt_implied_prob else "N/A"
+            logger.info(
+                f"LOW_PRICE_ENTRY_SNAPSHOT {ticker} | "
+                f"price={price}¢ base_prob={base_prob:.4f} our_prob={our_prob:.4f} "
+                f"market_implied={_mkt_implied_str} "
+                f"disagree={raw_disagreement:.0%} mip={mip_verdict} "
+                f"disagree_class={disagree_classification} "
+                f"sigma={sigma:.1f}°F agreement={agg.signal_agreement:.0%} "
+                f"calib={bias_level_for_gate} edge={edge:.3f} min_edge={min_edge_req:.3f} "
+                f"reasons={disagree_reasons}"
+            )
 
         # ── Shadow-mode evaluation log ─────────────────────────────────────────
         # Always log every scored recommendation (executed or not) so the
@@ -1124,14 +1437,19 @@ class TradeAnalysisEngine:
                 signal_breakdown=signal_breakdown,
                 weights_version=agg.weights_version,
                 context={
-                    "hours_left":          hours_left,
-                    "base_prob":           round(base_prob, 4),
-                    "signal_adj":          round(adj, 4),
-                    "cap_regime":          agg.cap_regime,
-                    "signal_agreement":    round(agg.signal_agreement, 3),
-                    "model_uncertainty":   round(agg.model_uncertainty, 3),
-                    "sigma_f":             round(sigma, 2),
-                    "extreme_disagreement": extreme_disagreement,
+                    "hours_left":             hours_left,
+                    "base_prob":              round(base_prob, 4),
+                    "signal_adj":             round(adj, 4),
+                    "cap_regime":             agg.cap_regime,
+                    "signal_agreement":       round(agg.signal_agreement, 3),
+                    "model_uncertainty":      round(agg.model_uncertainty, 3),
+                    "sigma_f":                round(sigma, 2),
+                    "extreme_disagreement":   extreme_disagreement,
+                    "mip_verdict":            mip_verdict,
+                    "raw_disagreement":       round(raw_disagreement, 4),
+                    "disagree_classification": disagree_classification,
+                    "is_low_price_entry":     is_low_price_entry,
+                    "calib_bias_level":       bias_level_for_gate,
                 },
             )
         except Exception as _shadow_err:
@@ -1152,6 +1470,14 @@ class TradeAnalysisEngine:
             "signal_agreement":    round(agg.signal_agreement, 3),
             "model_uncertainty":   round(agg.model_uncertainty, 3),
             "extreme_disagreement": extreme_disagreement,
+            # ── Disagreement classification ──────────────────────────────────
+            "mip_verdict":         mip_verdict,
+            "raw_disagreement":    round(raw_disagreement, 4),
+            "disagree_classification": disagree_classification,
+            "disagree_reasons":    disagree_reasons,
+            # ── Low-price entry diagnostics ──────────────────────────────────
+            "is_low_price_entry":  is_low_price_entry,
+            "calib_bias_level":    bias_level_for_gate,
             "spread":              (liquidity.get("spread") or
                                     (liquidity.get("best_ask_price", 50) -
                                      liquidity.get("best_bid_price", 50))),
