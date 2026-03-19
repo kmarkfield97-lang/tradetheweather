@@ -652,6 +652,9 @@ class Orchestrator:
                 market_type=rec.market_type,
                 model_uncertainty=getattr(rec, "model_uncertainty", 0.3),
                 entry_context=getattr(rec, "entry_context", None),
+                settlement_date=getattr(rec, "settlement_date", ""),
+                threshold=getattr(rec, "threshold", None),
+                is_bucket=getattr(rec, "is_bucket", False),
             )
 
             logger.info(

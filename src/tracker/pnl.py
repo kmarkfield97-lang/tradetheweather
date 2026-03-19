@@ -152,6 +152,158 @@ CITY_PRECIP_EXPOSURE_PCT = 0.15     # max 15% in precip markets for one city
 CITY_TOTAL_EXPOSURE_PCT = 0.20      # max 20% in any single city across all types
 THRESHOLD_STACK_GAP_F = 3.0         # block new YES if existing YES within ±3°F same city/type
 
+# ─── Weather thesis / conflict-detection policy ───────────────────────────────
+# Conservative default: for the same event key (city + market_type + settlement_date),
+# only allow a new position if it is directionally consistent with all existing
+# open positions AND all already-selected candidates in the current scan cycle.
+#
+# Directional opinion derived from (side, threshold, is_bucket):
+#   YES on T>=X   → bullish_above(X):  believes outcome >= X
+#   NO  on T>=X   → bearish_below(X):  believes outcome < X
+#   YES on B[X-Y] → inside_bucket(X,Y): believes outcome in [X,Y)
+#   NO  on B[X-Y] → outside_bucket(X,Y): believes outcome NOT in [X,Y)
+#
+# Conflict rules:
+#   bullish_above(A) vs bearish_below(B) where A and B are within CONFLICT_THRESH_F → CONFLICT
+#   bullish_above(A) vs bullish_above(B) — same direction, stacking — allowed unless within STACK_GAP
+#   bearish_below(A) vs bearish_below(B) — same direction, stacking — allowed
+#   inside_bucket vs bullish_above(X) where X falls inside bucket → partial conflict
+#
+# Two threshold positions conflict if their implied opinions are incompatible:
+#   YES@T68 (believes high >=68) + NO@T72 (believes high <72) → contradictory
+#   when the thresholds are close (within CONFLICT_THRESH_F) they directly contradict.
+#   When far apart they may ladder reinforcing views, but we apply conservative blocking.
+CONFLICT_THRESH_F = 8.0     # threshold distance within which opposing directions conflict
+SAME_EVENT_POLICY = "allow_reinforcing_only"   # conservative default
+
+
+def _make_event_key(city: str, market_type: str, settlement_date: str) -> str:
+    """Canonical event key for grouping positions on the same underlying weather outcome."""
+    return f"{city}|{market_type}|{settlement_date}"
+
+
+def _weather_thesis(
+    side: str,
+    threshold: Optional[float],
+    is_bucket: bool,
+) -> dict:
+    """
+    Derive a normalized directional opinion from a trade's parameters.
+
+    Returns a dict:
+      {
+        "direction": "bullish" | "bearish" | "inside_bucket" | "outside_bucket" | "unknown",
+        "threshold": float | None,
+        "bucket_low": float | None,   # only for bucket markets
+        "bucket_high": float | None,  # only for bucket markets
+        "side": "yes" | "no",
+      }
+
+    Direction semantics for threshold markets:
+      YES on T>=X  → bullish:  we believe the outcome will be >= X
+      NO  on T>=X  → bearish:  we believe the outcome will be  < X
+
+    For bucket markets:
+      YES on B[X-Y] → inside_bucket: we believe outcome ∈ [X, Y)
+      NO  on B[X-Y] → outside_bucket: we believe outcome ∉ [X, Y)
+    """
+    s = (side or "").lower()
+    if threshold is None:
+        return {"direction": "unknown", "threshold": None,
+                "bucket_low": None, "bucket_high": None, "side": s}
+
+    if is_bucket:
+        direction = "inside_bucket" if s == "yes" else "outside_bucket"
+        return {"direction": direction, "threshold": threshold,
+                "bucket_low": threshold, "bucket_high": None, "side": s}
+    else:
+        direction = "bullish" if s == "yes" else "bearish"
+        return {"direction": direction, "threshold": threshold,
+                "bucket_low": None, "bucket_high": None, "side": s}
+
+
+def _theses_conflict(a: dict, b: dict) -> tuple[bool, str]:
+    """
+    Determine whether two weather theses on the same event key conflict.
+    Returns (conflicts: bool, reason: str).
+
+    Conflict logic:
+    1. bullish(A) vs bearish(B):
+       - A == B → direct contradiction (YES@T70 + NO@T70 is theoretically impossible
+                 but treat as conflict if same ticker is re-evaluated)
+       - |A - B| < CONFLICT_THRESH_F → near-threshold contradiction
+         Example: YES@T70 (believes >=70) + NO@T72 (believes <72) → hidden contradiction
+         because if high ends up 70 or 71, both are at risk of loss simultaneously
+       - A > B → structural contradiction: YES@T72 (>=72) + NO@T70 (<70) → impossible
+         to win both (requires 70 <= high < 70 or high >= 72 — no overlap)
+         Actually: YES@T72 wins if high>=72; NO@T70 wins if high<70. These never both win.
+       - A < B by >= CONFLICT_THRESH_F → reinforcing ladder: YES@T68 + NO@T75
+         We think high is somewhere 68-75; this is a strangle-ish position, allowed.
+    2. bearish(A) vs bearish(B): same direction, allowed (both believe high < some threshold)
+    3. bullish(A) vs bullish(B): same direction, allowed (both believe high >= some threshold)
+       [Note: THRESHOLD_STACK_GAP_F check in check_correlation_limits still applies]
+    4. inside_bucket vs bullish: conflict if bullish threshold falls inside bucket range
+    5. inside_bucket vs bearish: conflict if bearish threshold falls inside bucket range
+    6. Two unknown theses: no conflict (we don't have enough info to judge)
+    """
+    dir_a = a.get("direction", "unknown")
+    dir_b = b.get("direction", "unknown")
+    thresh_a = a.get("threshold")
+    thresh_b = b.get("threshold")
+
+    if dir_a == "unknown" or dir_b == "unknown":
+        return False, ""
+
+    # Same direction — not a conflict
+    if dir_a == dir_b:
+        return False, ""
+
+    # bullish vs bearish (or vice versa)
+    if set([dir_a, dir_b]) == {"bullish", "bearish"}:
+        bull_thresh = thresh_a if dir_a == "bullish" else thresh_b
+        bear_thresh = thresh_a if dir_a == "bearish" else thresh_b
+        if bull_thresh is None or bear_thresh is None:
+            return False, ""
+
+        # Direct: YES@T70 + NO@T70 → same threshold, opposite sides
+        if abs(bull_thresh - bear_thresh) < 0.01:
+            return True, (
+                f"direct contradiction: YES@T{bull_thresh:.0f} vs NO@T{bear_thresh:.0f} "
+                f"(same threshold, opposite sides)"
+            )
+
+        # Structural: bullish threshold > bearish threshold
+        # YES@T72 + NO@T70 → can never both win (high must be both >=72 AND <70 — impossible)
+        if bull_thresh > bear_thresh:
+            return True, (
+                f"structural contradiction: YES@T{bull_thresh:.0f} (>=) vs NO@T{bear_thresh:.0f} (<) "
+                f"— gap={bull_thresh - bear_thresh:.1f}°F, can never both win"
+            )
+
+        # Near-threshold: |bull - bear| < CONFLICT_THRESH_F
+        # YES@T70 + NO@T72: believes high >=70 AND <72 — narrow band, hidden contradiction
+        gap = bear_thresh - bull_thresh
+        if gap < CONFLICT_THRESH_F:
+            return True, (
+                f"near-threshold contradiction: YES@T{bull_thresh:.0f} vs NO@T{bear_thresh:.0f} "
+                f"gap={gap:.1f}°F < {CONFLICT_THRESH_F}°F conflict threshold"
+            )
+
+        # Reinforcing ladder: bull_thresh < bear_thresh by >= CONFLICT_THRESH_F
+        # YES@T68 + NO@T76: we believe high is between 68 and 76 — coherent strangle
+        return False, ""
+
+    # inside_bucket vs bullish/bearish
+    if "inside_bucket" in (dir_a, dir_b) or "outside_bucket" in (dir_a, dir_b):
+        # Conservative: treat any bucket vs threshold combination as potential conflict
+        # unless we have clear evidence they're reinforcing. Block by default.
+        return True, (
+            f"bucket vs threshold conflict: {dir_a}@T{thresh_a} vs {dir_b}@T{thresh_b} "
+            f"— mixed market types on same event; conservative block"
+        )
+
+    return False, ""
+
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -548,6 +700,10 @@ class Position:
     trade_tier: str = "standard"   # "top_tier" / "standard" / "marginal"
     # ── Cached market metadata ────────────────────────────────────────────────
     close_time: Optional[str] = None  # cached from Kalshi API; avoids repeated calls every 5 min
+    # ── Settlement / conflict-detection fields ────────────────────────────────
+    settlement_date: str = ""          # ISO date (YYYY-MM-DD) from close_time at entry
+    threshold: Optional[float] = None  # numeric threshold (°F) parsed from ticker
+    is_bucket: bool = False            # True if this is a bucket (B) market
 
 
 @dataclass
@@ -805,7 +961,10 @@ class PnLTracker:
         """
         city_temp: dict[str, float] = {}
         city_precip: dict[str, float] = {}
-        city_thresholds: dict[str, list] = {}  # city:market_type -> [threshold, ...]
+        city_thresholds: dict[str, list] = {}  # city:market_type -> [(threshold, side), ...]
+        # event_theses: event_key -> [(thesis_dict, ticker), ...]
+        # Used by the directional conflict check.
+        event_theses: dict[str, list] = {}
 
         for pos in self.state.positions:
             if pos.status != "open":
@@ -819,17 +978,27 @@ class PnLTracker:
             elif mtype in ("rain", "snow"):
                 city_precip[city] = city_precip.get(city, 0.0) + cost
 
-            # Track thresholds for stack-exposure check
+            # Track thresholds for stack-exposure check (legacy path, kept for YES-YES gap check)
             parsed = _parse_ticker(pos.ticker)
             thresh = parsed.get("threshold")
             if thresh is not None and city and mtype:
                 key = f"{city}:{mtype}"
                 city_thresholds.setdefault(key, []).append((thresh, pos.side))
 
+            # Build weather thesis for directional conflict detection
+            # Prefer the threshold stored on the position; fall back to ticker parse.
+            pos_thresh = pos.threshold if pos.threshold is not None else thresh
+            pos_is_bucket = pos.is_bucket if hasattr(pos, "is_bucket") else parsed.get("is_bucket", False)
+            if city and mtype:
+                ekey = _make_event_key(city, mtype, pos.settlement_date or "")
+                thesis = _weather_thesis(pos.side, pos_thresh, pos_is_bucket)
+                event_theses.setdefault(ekey, []).append((thesis, pos.ticker))
+
         return {
             "city_temp_exposure": city_temp,
             "city_precip_exposure": city_precip,
             "city_thresholds": city_thresholds,
+            "event_theses": event_theses,
         }
 
     def check_correlation_limits(self, rec) -> tuple[bool, str]:
@@ -895,6 +1064,36 @@ class PnLTracker:
                             f"@{existing_thresh}°F within {THRESHOLD_STACK_GAP_F}°F of "
                             f"new @{new_thresh}°F"
                         )
+
+        # ── Directional conflict check vs open positions ───────────────────────
+        # Check if the new trade's weather thesis conflicts with any existing open
+        # position on the same event key (city + market_type + settlement_date).
+        rec_settlement = getattr(rec, "settlement_date", "") or ""
+        rec_threshold = getattr(rec, "threshold", None)
+        rec_is_bucket = getattr(rec, "is_bucket", False)
+
+        # Fall back to ticker parse if the recommendation doesn't carry these fields
+        if rec_threshold is None:
+            _rec_parsed = _parse_ticker(getattr(rec, "ticker", ""))
+            rec_threshold = _rec_parsed.get("threshold")
+            rec_is_bucket = _rec_parsed.get("is_bucket", False)
+
+        new_thesis = _weather_thesis(side, rec_threshold, rec_is_bucket)
+        if new_thesis["direction"] != "unknown" and city and mtype:
+            ekey = _make_event_key(city, mtype, rec_settlement)
+            for existing_thesis, existing_ticker in exp.get("event_theses", {}).get(ekey, []):
+                conflicts, conflict_reason = _theses_conflict(new_thesis, existing_thesis)
+                if conflicts:
+                    logger.info(
+                        f"CONFLICT_BLOCK {getattr(rec, 'ticker', '?')} "
+                        f"city={city} type={mtype} date={rec_settlement} "
+                        f"new_side={side} new_thresh={rec_threshold} "
+                        f"existing={existing_ticker} — {conflict_reason}"
+                    )
+                    return False, (
+                        f"directional conflict with open position {existing_ticker}: "
+                        f"{conflict_reason}"
+                    )
 
         return True, ""
 
@@ -1577,7 +1776,10 @@ class PnLTracker:
                      contracts: int, entry_price: int, cost_dollars: float,
                      city: str = "", market_type: str = "",
                      model_uncertainty: float = 0.3,
-                     entry_context: Optional[dict] = None):
+                     entry_context: Optional[dict] = None,
+                     settlement_date: str = "",
+                     threshold: Optional[float] = None,
+                     is_bucket: bool = False):
         """
         Records a new trade entry. entry_context is the dict attached to
         TradeRecommendation containing the full decision snapshot (probabilities,
@@ -1626,6 +1828,9 @@ class PnLTracker:
             entry_liquidity_dollars=ctx.get("exec_liq"),
             fragile_flags=fragile_flags,
             trade_tier=ctx.get("trade_tier", "standard"),
+            settlement_date=settlement_date,
+            threshold=threshold,
+            is_bucket=is_bucket,
         )
         self.state.positions.append(pos)
         self.state.trades_placed += 1

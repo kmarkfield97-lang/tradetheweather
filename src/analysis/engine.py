@@ -197,6 +197,71 @@ CITY_HIGH_PEAK_HOUR: dict = {
 }
 DEFAULT_HIGH_PEAK_HOUR = 19  # 7pm local — sensible default for interior cities
 
+# ── Weather thesis / inter-candidate conflict detection ────────────────────────
+# Mirrors the policy in tracker/pnl.py.  Kept in sync manually — changes here
+# must also be applied to pnl.py's CONFLICT_THRESH_F / _theses_conflict.
+_CONFLICT_THRESH_F = 8.0  # opposing-direction thresholds within this gap → conflict
+
+
+def _engine_weather_thesis(side: str, threshold: Optional[float], is_bucket: bool) -> dict:
+    """Derive a normalized directional opinion.  See pnl._weather_thesis for full docs."""
+    s = (side or "").lower()
+    if threshold is None:
+        return {"direction": "unknown", "threshold": None, "side": s}
+    if is_bucket:
+        direction = "inside_bucket" if s == "yes" else "outside_bucket"
+    else:
+        direction = "bullish" if s == "yes" else "bearish"
+    return {"direction": direction, "threshold": threshold, "side": s}
+
+
+def _engine_theses_conflict(a: dict, b: dict) -> tuple[bool, str]:
+    """
+    Determine whether two weather theses on the same event key conflict.
+    Returns (conflicts: bool, reason: str).
+    Mirrors pnl._theses_conflict — keep in sync.
+    """
+    dir_a = a.get("direction", "unknown")
+    dir_b = b.get("direction", "unknown")
+    thresh_a = a.get("threshold")
+    thresh_b = b.get("threshold")
+
+    if dir_a == "unknown" or dir_b == "unknown":
+        return False, ""
+    if dir_a == dir_b:
+        return False, ""
+
+    if set([dir_a, dir_b]) == {"bullish", "bearish"}:
+        bull_thresh = thresh_a if dir_a == "bullish" else thresh_b
+        bear_thresh = thresh_a if dir_a == "bearish" else thresh_b
+        if bull_thresh is None or bear_thresh is None:
+            return False, ""
+        if abs(bull_thresh - bear_thresh) < 0.01:
+            return True, (
+                f"direct contradiction YES@T{bull_thresh:.0f} vs NO@T{bear_thresh:.0f}"
+            )
+        if bull_thresh > bear_thresh:
+            return True, (
+                f"structural contradiction YES@T{bull_thresh:.0f} vs NO@T{bear_thresh:.0f} "
+                f"gap={bull_thresh - bear_thresh:.1f}°F — can never both win"
+            )
+        gap = bear_thresh - bull_thresh
+        if gap < _CONFLICT_THRESH_F:
+            return True, (
+                f"near-threshold contradiction YES@T{bull_thresh:.0f} vs NO@T{bear_thresh:.0f} "
+                f"gap={gap:.1f}°F < {_CONFLICT_THRESH_F}°F"
+            )
+        return False, ""
+
+    # bucket vs threshold: conservative block
+    if "bucket" in dir_a or "bucket" in dir_b:
+        return True, (
+            f"bucket vs threshold conflict: {dir_a}@T{thresh_a} vs {dir_b}@T{thresh_b}"
+        )
+
+    return False, ""
+
+
 # Kalshi weather series prefix → city key mapping (shared with tracker/pnl.py)
 SERIES_CITY_MAP: dict = {
     "KXHIGHTPHX": "PHOENIX", "KXHIGHTHOU": "HOUSTON", "KXHIGHTMIN": "MINNEAPOLIS",
@@ -242,6 +307,12 @@ class TradeRecommendation:
     # under balanced / profit_tilted operating profiles.
     trade_tier: str = "standard"
     trade_tier_reasons: list[str] = field(default_factory=list)
+    # ── Settlement / conflict-detection fields ────────────────────────────────
+    # settlement_date: ISO date string (YYYY-MM-DD) of the market's close/settlement.
+    # threshold and is_bucket are parsed from the ticker for the conflict engine.
+    settlement_date: str = ""          # e.g. "2026-03-19"
+    threshold: Optional[float] = None  # e.g. 72.0 for a T72 market
+    is_bucket: bool = False            # True for bucket (B) markets, False for threshold (T)
 
 
 class TradeAnalysisEngine:
@@ -984,14 +1055,22 @@ class TradeAnalysisEngine:
                 logger.warning(f"REJECTED {ticker}: exception during evaluation — {e}")
                 continue
 
-        # Deduplicate: only one trade per city+market_type to avoid contradictory positions.
+        # Deduplicate: only one trade per city+market_type+settlement_date to avoid
+        # contradictory positions on the same underlying weather event.
+        # Among candidates with the same event key, keep the highest-edge one.
         seen: set = set()
         deduped = []
         for rec in sorted(candidates, key=lambda r: r.edge, reverse=True):
-            key = (rec.city, rec.market_type)
+            key = (rec.city, rec.market_type, rec.settlement_date)
             if key not in seen:
                 seen.add(key)
                 deduped.append(rec)
+            else:
+                logger.info(
+                    f"DEDUP_DROP {rec.ticker}: same event key "
+                    f"city={rec.city} type={rec.market_type} date={rec.settlement_date} "
+                    f"edge={rec.edge:.3f} — lower-edge duplicate dropped"
+                )
 
         # Rank by conviction score (multi-factor)
         for rec in deduped:
@@ -1043,6 +1122,41 @@ class TradeAnalysisEngine:
             if len(selected) >= trades_remaining:
                 # Daily cap exhausted — remaining candidates are cap-rejected.
                 skipped_cap.append(rec.ticker)
+                continue
+
+            # ── Inter-candidate conflict check ────────────────────────────────
+            # Before accepting this candidate, verify it doesn't conflict with
+            # any already-selected candidate in this scan cycle on the same
+            # underlying weather event.
+            rec_thesis = _engine_weather_thesis(
+                rec.side, rec.threshold, rec.is_bucket
+            )
+            candidate_conflict = False
+            candidate_conflict_reason = ""
+            for sel in selected:
+                if (sel.city == rec.city
+                        and sel.market_type == rec.market_type
+                        and sel.settlement_date == rec.settlement_date):
+                    sel_thesis = _engine_weather_thesis(
+                        sel.side, sel.threshold, sel.is_bucket
+                    )
+                    conflicts, reason = _engine_theses_conflict(rec_thesis, sel_thesis)
+                    if conflicts:
+                        candidate_conflict = True
+                        candidate_conflict_reason = (
+                            f"inter-candidate conflict with already-selected "
+                            f"{sel.ticker} ({sel.side}@T{sel.threshold}): {reason}"
+                        )
+                        break
+
+            if candidate_conflict:
+                logger.info(
+                    f"  RANK_{rank:02d} REJECT_CONFLICT {rec.ticker} "
+                    f"city={rec.city} type={rec.market_type} date={rec.settlement_date} "
+                    f"side={rec.side} thresh={rec.threshold} "
+                    f"— {candidate_conflict_reason}"
+                )
+                skipped_ext.append((rec.ticker, candidate_conflict_reason))
                 continue
 
             if rank > EXTENDED_QUALITY_RANK_THRESHOLD:
@@ -1874,6 +1988,15 @@ class TradeAnalysisEngine:
             "trade_tier":          "standard",
         }
 
+        # Derive settlement date string for conflict detection
+        _settlement_date = ""
+        if close_time:
+            try:
+                _ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                _settlement_date = _ct.date().isoformat()
+            except Exception:
+                pass
+
         return TradeRecommendation(
             ticker=ticker,
             market_title=title,
@@ -1894,6 +2017,9 @@ class TradeAnalysisEngine:
             signal_breakdown=signal_breakdown,
             weights_version=agg.weights_version,
             entry_context=entry_ctx,
+            settlement_date=_settlement_date,
+            threshold=threshold,
+            is_bucket=is_bucket,
         )
 
     # ─────────────────────────────────────────────────────────────────────────
