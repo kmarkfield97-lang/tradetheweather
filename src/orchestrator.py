@@ -17,7 +17,7 @@ from src.weather.pipeline import WeatherPipeline
 from src.analysis.engine import TradeAnalysisEngine
 from src.analysis.advisor import run_advisor_session
 from src.analysis.uncertainty_recalibrator import run_recalibration_session
-from src.tracker.pnl import PnLTracker
+from src.tracker.pnl import PnLTracker, _hours_to_settlement, EXIT_EXPIRED
 from src.tracker.history import DailyHistoryTracker, _get_season_for_date
 
 logger = logging.getLogger(__name__)
@@ -241,6 +241,12 @@ class Orchestrator:
         try:
             await self._check_order_fills()
 
+            # P0 FIX: detect positions that settled naturally (held to expiration)
+            # and record them before refreshing balance.  Without this, cost_dollars
+            # for expired positions would inflate _portfolio_value() and mask losses
+            # from the daily-brake system.
+            await self._detect_settled_positions()
+
             was_halted = self.tracker.state.trading_halted
             self.tracker.refresh_balance()
 
@@ -396,6 +402,170 @@ class Orchestrator:
 
         except Exception as e:
             logger.error(f"Check order fills error: {e}")
+
+    # -------------------------------------------------------------------------
+    # Settlement detection
+    # -------------------------------------------------------------------------
+
+    async def _detect_settled_positions(self):
+        """
+        P0 FIX — balance reconciliation.
+
+        When the bot holds a position to natural expiration (no explicit exit order),
+        the position stays "open" in daily_state.json but disappears from Kalshi.
+        This means _portfolio_value() keeps counting cost_dollars that are already
+        gone, hiding losses from the daily-brake system and inflating realized_pnl.
+
+        This method detects naturally-settled positions by:
+          1. Fetching current Kalshi open positions (ground truth).
+          2. For each tracked "open" position that is no longer in Kalshi,
+             fetching the market status to determine win or loss.
+          3. Recording the exit via record_exit() so realized_pnl and daily-brake
+             math stay accurate.
+
+        Called every 5 minutes from _balance_refresh_job, after fill checks.
+        """
+        try:
+            # Fetch current Kalshi open positions (tickers with non-zero contracts)
+            kalshi_positions = await asyncio.get_event_loop().run_in_executor(
+                None, self.kalshi.get_positions
+            )
+            active_tickers: set = set()
+            for kp in kalshi_positions:
+                position_count = kp.get("position", 0) or 0
+                if position_count != 0:
+                    active_tickers.add(kp.get("ticker", ""))
+
+            candidates = []
+            for pos in self.tracker.state.positions:
+                if pos.status != "open":
+                    continue
+                if pos.ticker in active_tickers:
+                    continue  # Still open in Kalshi — not settled
+
+                # Not in Kalshi's positions.  Only investigate if:
+                #   (a) close_time is set and has passed, OR
+                #   (b) close_time is unknown (None) — could have settled silently
+                # Allow a 30-minute buffer before acting (avoid race with resting fills).
+                hours_left = _hours_to_settlement(pos.close_time)
+                if hours_left is not None and hours_left > 0.5:
+                    # Still time on the clock — likely a fill-timing lag, not settlement
+                    continue
+
+                candidates.append(pos)
+
+            if not candidates:
+                return
+
+            for pos in candidates:
+                try:
+                    # Fetch market to get authoritative status + result
+                    market_data = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda t=pos.ticker: self.kalshi.get_market(t)
+                    )
+                    market = market_data.get("market", market_data)
+                    market_status = (market.get("status") or "").lower()
+                    market_result = (market.get("result") or "").lower()
+
+                    # Only act if market is definitively resolved
+                    if market_status not in ("settled", "finalized", "closed"):
+                        # Market not yet final — skip to avoid recording wrong outcome
+                        logger.debug(
+                            f"SETTLEMENT_CHECK {pos.ticker}: not in Kalshi positions but "
+                            f"market_status={market_status!r} — waiting for resolution"
+                        )
+                        continue
+
+                    remaining = pos.contracts - pos.trimmed_contracts
+                    if remaining <= 0:
+                        continue
+
+                    # Determine win/loss from market result
+                    if market_result == "yes":
+                        won = (pos.side == "yes")
+                    elif market_result == "no":
+                        won = (pos.side == "no")
+                    else:
+                        # Result field absent or non-standard — skip rather than guess
+                        logger.warning(
+                            f"SETTLEMENT_UNKNOWN_RESULT {pos.ticker}: "
+                            f"status={market_status!r} result={market_result!r} — skipping"
+                        )
+                        continue
+
+                    if won:
+                        exit_price = 100  # settled at full value
+                        pnl = ((100 - pos.entry_price) / 100.0) * remaining
+                    else:
+                        exit_price = 0    # expired worthless
+                        pnl = -(pos.entry_price / 100.0) * remaining
+
+                    logger.warning(
+                        f"SETTLEMENT_DETECTED {pos.ticker} {pos.side.upper()} "
+                        f"{remaining}x | result={market_result} won={won} "
+                        f"exit={exit_price}¢ pnl=${pnl:+.2f} "
+                        f"market_status={market_status}"
+                    )
+
+                    self.tracker.record_exit(
+                        pos.order_id, exit_price, pnl, remaining,
+                        exit_reason=EXIT_EXPIRED,
+                    )
+
+                    if self.bot:
+                        outcome_label = "WIN ✓" if won else "LOSS ✗"
+                        price_str = f"@ {exit_price}¢" if won else "expired worthless"
+                        await self.bot.send_alert(
+                            f"SETTLEMENT {outcome_label}: "
+                            f"{pos.ticker} {pos.side.upper()} {remaining}x | "
+                            f"{price_str} | P&L: ${pnl:+.2f}"
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        f"_detect_settled_positions: error processing {pos.ticker}: {e}",
+                        exc_info=True,
+                    )
+
+        except Exception as e:
+            logger.error(f"_detect_settled_positions: {e}", exc_info=True)
+
+    # -------------------------------------------------------------------------
+    # Halted-opportunity diagnostics
+    # -------------------------------------------------------------------------
+
+    def _log_halted_missed_opportunity(self, rec, halt_reason: str):
+        """
+        P2 — When trading is halted and a scan would otherwise produce a valid
+        signal, log it as a missed opportunity with session context.
+
+        This gives visibility into whether session-based halts are blocking
+        good later-day trades, without taking any trading action.
+        """
+        try:
+            logger.info(
+                f"HALTED_MISS {rec.ticker} | "
+                f"city={rec.city} type={rec.market_type} "
+                f"side={rec.side.upper()} edge={rec.edge:.3f} "
+                f"confidence={rec.confidence} price={rec.market_price}¢ "
+                f"halt_reason={halt_reason!r} | "
+                f"would qualify absent halt"
+            )
+            # Also record in missed_opportunities.json for offline analysis
+            try:
+                self.history.record_missed_opportunity(
+                    ticker=rec.ticker,
+                    city=rec.city,
+                    market_type=rec.market_type,
+                    rejection_reason=f"halted({halt_reason})",
+                    our_prob=rec.our_probability,
+                    market_price_cents=rec.market_price,
+                    edge_cents=rec.edge * 100,
+                )
+            except Exception:
+                pass  # best-effort only
+        except Exception as e:
+            logger.debug(f"_log_halted_missed_opportunity: {e}")
 
     # -------------------------------------------------------------------------
     # Market scan
@@ -594,9 +764,23 @@ class Orchestrator:
                         f"(edge={rec.edge:.3f}, confidence={rec.confidence})"
                     )
                     self.tracker.record_goal_exception()
+
                 else:
-                    logger.info(f"Trading halted: {reason}")
-                    break
+                    # P1 FIX: session-aware halt — allow second session for a different
+                    # market family (temp_high/rain) when halt was caused by temp_low
+                    second_ok, second_reason = self.tracker.can_trade_second_session(rec)
+                    if second_ok:
+                        logger.info(
+                            f"SECOND_SESSION_EXCEPTION {rec.ticker}: {second_reason}"
+                        )
+                        self.tracker.record_second_session_trade()
+                        # Fall through to execute this trade below
+
+                    else:
+                        # P2: log halted signals with session context for diagnostics
+                        self._log_halted_missed_opportunity(rec, reason)
+                        # Don't break — continue logging subsequent candidates
+                        continue
 
             # Correlated exposure check
             corr_ok, corr_reason = self.tracker.check_correlation_limits(rec)

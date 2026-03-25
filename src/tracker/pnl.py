@@ -145,6 +145,18 @@ FRAGILE_LOW_PRICE_CENTS   = 20   # entries below this are flagged "low_price_ent
 FRAGILE_SAME_DAY_HOURS    = 6    # entries with <6h left flagged "same_day_entry"
 FRAGILE_FINAL_HOURS_HOURS = 3    # entries with <3h left flagged "final_hours_entry"
 
+# ─── Second-session trading window ────────────────────────────────────────────
+# When the overnight temp_low session triggers a halt (soft/medium brake), the
+# bot can still execute a limited number of trades in a separate later session
+# (e.g., afternoon temp_high markets) provided the bars below are cleared.
+#
+# These constants control when and how much the second window is allowed.
+# The hard -5% global brake is NEVER bypassed by second-session logic.
+SECOND_SESSION_MAX_TRADES   = 1      # max trades allowed in the second session
+SECOND_SESSION_MIN_HOUR_PT  = 10     # earliest PT hour for second session (10am = temp_high window)
+SECOND_SESSION_MIN_EDGE     = 0.18   # minimum 18¢ edge required for second session
+SECOND_SESSION_BUDGET_PCT   = 0.05   # max 5% of starting_balance per second-session trade
+
 # ─── Correlated exposure caps ─────────────────────────────────────────────────
 # Fractions of starting_balance; enforced per city
 CITY_TEMP_EXPOSURE_PCT = 0.15       # max 15% in temp markets for one city
@@ -721,6 +733,11 @@ class DailyState:
     goal_exception_trades: int = 0  # trades allowed past +5% goal (max 2/day)
     pending_buy_dollars: float = 0.0  # capital reserved by resting buy orders (updated by orchestrator)
     stall_alert_counts: dict = field(default_factory=dict)  # ticker -> consecutive stall cycles seen
+    # ── Session-aware halt tracking ───────────────────────────────────────────
+    # Records which market types were open when a soft/medium brake fired.
+    # Used to determine whether a "second session" trade is eligible.
+    halt_market_types: list = field(default_factory=list)  # e.g. ["temp_low"]
+    second_session_trades: int = 0  # trades taken in second-session window today
 
 
 # ─── PnLTracker ──────────────────────────────────────────────────────────────
@@ -825,6 +842,8 @@ class PnLTracker:
             self.state.daily_brake_level = 3
             self.state.trading_halted = True
             self.state.halt_reason = f"Daily stop loss triggered ({pnl_pct * 100:.1f}%)"
+            # Hard brake clears any second-session allowance — global halt, no exceptions
+            self.state.halt_market_types = ["temp_low", "temp_high", "rain", "snow"]
             self._save()
             self.trigger_stop_loss(locked_ok=True)
 
@@ -832,14 +851,32 @@ class PnLTracker:
             self.state.daily_brake_level = 2
             self.state.trading_halted = True
             self.state.halt_reason = f"Daily brake medium: new entries disabled ({pnl_pct * 100:.1f}%)"
-            logger.warning(f"Daily brake MEDIUM: {pnl_pct * 100:.1f}% drawdown — tightening exits")
+            # Record which market types caused the halt so second-session logic can filter
+            if not self.state.halt_market_types:
+                self.state.halt_market_types = list({
+                    p.market_type for p in self.state.positions
+                    if p.status == "open" and p.market_type
+                })
+            logger.warning(
+                f"Daily brake MEDIUM: {pnl_pct * 100:.1f}% drawdown — tightening exits | "
+                f"halt_market_types={self.state.halt_market_types}"
+            )
             self._save()
 
         elif pnl_pct <= -DAILY_BRAKE_SOFT_PCT and self.state.daily_brake_level < 1:
             self.state.daily_brake_level = 1
             self.state.trading_halted = True
             self.state.halt_reason = f"Daily brake soft: new entries disabled ({pnl_pct * 100:.1f}%)"
-            logger.warning(f"Daily brake SOFT: {pnl_pct * 100:.1f}% drawdown — new entries disabled")
+            # Record which market types caused the halt
+            if not self.state.halt_market_types:
+                self.state.halt_market_types = list({
+                    p.market_type for p in self.state.positions
+                    if p.status == "open" and p.market_type
+                })
+            logger.warning(
+                f"Daily brake SOFT: {pnl_pct * 100:.1f}% drawdown — new entries disabled | "
+                f"halt_market_types={self.state.halt_market_types}"
+            )
             self._save()
 
     def get_effective_deployable_capital(self) -> dict:
@@ -946,6 +983,98 @@ class PnLTracker:
     def record_goal_exception(self):
         """Increment exception trade counter and persist."""
         self.state.goal_exception_trades += 1
+        self._save()
+
+    def can_trade_second_session(self, rec) -> tuple[bool, str]:
+        """
+        Returns (allowed, reason) for a second-session trade exception.
+
+        The second session allows a limited number of trades in a different market
+        family (temp_high, rain) after the overnight temp_low session has triggered
+        a soft or medium daily brake.
+
+        Hard rules that always apply:
+          - Hard brake (-5%, daily_brake_level == 3): NEVER allowed
+          - Global halt from profit target: NOT allowed (goal_met uses its own gate)
+          - Max SECOND_SESSION_MAX_TRADES per day
+          - Only temp_high and rain market types eligible
+          - Market type must NOT be in halt_market_types (wasn't the session that halted)
+          - Time gate: must be past SECOND_SESSION_MIN_HOUR_PT in PT
+          - Edge gate: >= SECOND_SESSION_MIN_EDGE
+          - Confidence must be "high"
+          - Budget gate: cost <= SECOND_SESSION_BUDGET_PCT of starting_balance
+        """
+        from zoneinfo import ZoneInfo
+
+        if not self.state.trading_halted:
+            return False, "not halted — use normal can_trade()"
+
+        # Hard brake blocks everything — no exceptions
+        if self.state.daily_brake_level >= 3:
+            return False, "hard stop-loss active — no second session allowed"
+
+        # Profit target halt uses its own exception mechanism
+        if self.state.goal_met:
+            return False, "goal_met — use is_high_conviction_exception() instead"
+
+        # Second session trade cap
+        if self.state.second_session_trades >= SECOND_SESSION_MAX_TRADES:
+            return False, f"second session limit reached ({SECOND_SESSION_MAX_TRADES} trade)"
+
+        market_type = getattr(rec, "market_type", "") or ""
+        if not market_type:
+            return False, "unknown market_type"
+
+        # Only temp_high and rain qualify for second session
+        if market_type not in ("temp_high", "rain"):
+            return False, f"market_type={market_type} not eligible for second session"
+
+        # Block if this market type was part of the session that caused the halt
+        if market_type in self.state.halt_market_types:
+            return False, (
+                f"market_type={market_type} was in halted session "
+                f"(halt_market_types={self.state.halt_market_types})"
+            )
+
+        # Time gate: temp_high/rain second session only after morning hours
+        try:
+            pt_now = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Los_Angeles"))
+            if pt_now.hour < SECOND_SESSION_MIN_HOUR_PT:
+                return False, (
+                    f"before second session window "
+                    f"(PT hour={pt_now.hour}, need >={SECOND_SESSION_MIN_HOUR_PT})"
+                )
+        except Exception:
+            return False, "could not determine PT time for second session gate"
+
+        # Edge and confidence gate (higher bar than normal)
+        edge = getattr(rec, "edge", 0.0) or 0.0
+        confidence = getattr(rec, "confidence", "") or ""
+        if edge < SECOND_SESSION_MIN_EDGE:
+            return False, (
+                f"edge={edge:.3f} < {SECOND_SESSION_MIN_EDGE:.3f} second session minimum"
+            )
+        if confidence != "high":
+            return False, f"confidence={confidence} must be 'high' for second session"
+
+        # Budget gate: strict cap on second session exposure
+        cost = getattr(rec, "cost_dollars", 0.0) or 0.0
+        budget = self.state.starting_balance * SECOND_SESSION_BUDGET_PCT
+        if cost > budget:
+            return False, (
+                f"cost ${cost:.2f} > second session budget ${budget:.2f} "
+                f"({SECOND_SESSION_BUDGET_PCT:.0%} of starting_balance)"
+            )
+
+        return True, (
+            f"second session approved: market_type={market_type} "
+            f"edge={edge:.3f} confidence={confidence} cost=${cost:.2f} "
+            f"PT_hour={pt_now.hour}"
+        )
+
+    def record_second_session_trade(self):
+        """Increment second session trade counter and persist."""
+        self.state.second_session_trades += 1
         self._save()
 
     def validate_position_size(self, cost_dollars: float) -> tuple[bool, str]:

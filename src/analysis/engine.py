@@ -139,6 +139,26 @@ TEMP_LOW_EXTREME_SIGMA_F        = 10.0  # °F
 TEMP_LOW_EXTREME_SIGMA_EDGE     = 0.05  # +5¢ extra when sigma > 10°F
 TEMP_LOW_POOR_CALIB_MIN_EDGE    = 0.12  # 12¢ minimum for warn/penalty temp_low
 
+# ── Near-threshold fragile entry gate ─────────────────────────────────────────
+# When the NWS forecast is very close to the market threshold, small forecast
+# errors can completely flip the outcome.  A 1°F miss against a 0.5°F forecast
+# gap is the difference between a win and a loss.
+#
+# Two-tier protection:
+#   NEAR_THRESHOLD_HARD_REJECT_F : below this → hard reject regardless of edge
+#   NEAR_THRESHOLD_MIN_DIFF_F    : below this but >= hard_reject → require extra edge
+#   NEAR_THRESHOLD_EDGE_PENALTY  : extra edge requirement in the soft zone
+#
+# These constants apply to the RAW NWS forecast diff (before trend/bias correction),
+# which is the most conservative benchmark for forecast fragility.
+#
+# Example: NWS low forecast = 42.4°F, threshold = 42°F → diff = 0.4°F < hard reject
+#   → entry blocked even if edge is nominally large, because the forecast error
+#     distribution likely straddles the threshold.
+NEAR_THRESHOLD_HARD_REJECT_F  = 0.5   # < 0.5°F raw diff → hard reject
+NEAR_THRESHOLD_MIN_DIFF_F     = 1.5   # < 1.5°F raw diff → require extra edge
+NEAR_THRESHOLD_EDGE_PENALTY   = 0.08  # +8¢ extra edge required in soft zone
+
 # ── Extended quality gate (trades ranked 11–15) ───────────────────────────────
 # Trades ranked above EXTENDED_QUALITY_RANK_THRESHOLD face tighter checks so
 # expanding the daily cap from 10→15 does not dilute quality.
@@ -1669,6 +1689,54 @@ class TradeAnalysisEngine:
                     f"{ticker}: temp_low extreme sigma surcharge +{TEMP_LOW_EXTREME_SIGMA_EDGE*100:.0f}¢ "
                     f"sigma={sigma:.1f}°F > {TEMP_LOW_EXTREME_SIGMA_F}°F → min_edge={min_edge_req:.3f}"
                 )
+
+        # ── Near-threshold fragile entry gate ──────────────────────────────────
+        # Check raw NWS forecast vs threshold.  If the forecast is extremely close
+        # to the threshold, a small forecast error flips the outcome entirely.
+        # Use the raw NWS forecast value (pre-trend, pre-bias) as the benchmark —
+        # this is deliberately conservative.
+        if market_type in ("temp_high", "temp_low") and threshold is not None:
+            _fc_data = report.get("forecast", {})
+            _raw_fc_val = (
+                _fc_data.get("high_temp_f") if market_type == "temp_high"
+                else _fc_data.get("low_temp_f")
+            )
+            if _raw_fc_val is not None:
+                _raw_diff = _raw_fc_val - threshold  # positive = above threshold
+                # For temp_low YES: want raw_diff < 0 (forecast < threshold) — diff is negative
+                # For temp_high YES: want raw_diff > 0 (forecast > threshold) — diff is positive
+                # In both cases the magnitude of diff tells us how fragile the entry is
+                _abs_diff = abs(_raw_diff)
+
+                if _abs_diff < NEAR_THRESHOLD_HARD_REJECT_F:
+                    logger.warning(
+                        f"REJECTED {ticker}: near_threshold_fragile_block | "
+                        f"raw forecast {_raw_fc_val:.1f}°F vs threshold {threshold:.0f}°F "
+                        f"diff={_raw_diff:+.2f}°F abs={_abs_diff:.2f}°F "
+                        f"< hard_reject={NEAR_THRESHOLD_HARD_REJECT_F}°F — "
+                        f"forecast error distribution straddles threshold"
+                    )
+                    self._record_missed_opportunity(
+                        ticker=ticker, city=city, market_type=market_type,
+                        rejection_reason=(
+                            f"near_threshold_fragile_block("
+                            f"diff={_raw_diff:+.2f}F,hard_reject={NEAR_THRESHOLD_HARD_REJECT_F}F)"
+                        ),
+                        our_prob=our_prob, market_price_cents=price, edge_cents=edge * 100,
+                    )
+                    return None
+
+                elif _abs_diff < NEAR_THRESHOLD_MIN_DIFF_F:
+                    # Soft zone: require extra edge to compensate for threshold proximity
+                    old_min = min_edge_req
+                    min_edge_req = max(min_edge_req, min_edge_req + NEAR_THRESHOLD_EDGE_PENALTY)
+                    logger.info(
+                        f"{ticker}: near_threshold_fragile_surcharge | "
+                        f"raw diff={_raw_diff:+.2f}°F abs={_abs_diff:.2f}°F "
+                        f"[{NEAR_THRESHOLD_HARD_REJECT_F:.1f}–{NEAR_THRESHOLD_MIN_DIFF_F:.1f}°F zone] "
+                        f"→ min_edge {old_min:.3f} + {NEAR_THRESHOLD_EDGE_PENALTY*100:.0f}¢ "
+                        f"= {min_edge_req:.3f}"
+                    )
 
         # ── Low-price + large-disagreement combined gate ───────────────────────
         # Determine whether forecast is fresh (for disagree classification)
