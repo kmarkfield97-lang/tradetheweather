@@ -765,11 +765,11 @@ class PnLTracker:
                 ]
                 state_data = {k: v for k, v in data.items() if k in known_state and k != "positions"}
                 return DailyState(**state_data, positions=positions)
-        starting_balance = self._fetch_balance()
+        starting_balance = self._fetch_portfolio_value()
         state = DailyState(
             date=today,
             starting_balance=starting_balance,
-            current_balance=starting_balance,
+            current_balance=self._fetch_balance(),
         )
         self._save(state)
         return state
@@ -786,6 +786,15 @@ class PnLTracker:
             except Exception:
                 pass
         return 50.0
+
+    def _fetch_portfolio_value(self) -> float:
+        """Returns total portfolio value: cash + mark value of open positions."""
+        if self.kalshi:
+            try:
+                return self.kalshi.get_portfolio_value()
+            except Exception:
+                pass
+        return self._fetch_balance()
 
     # ── Rule checks & daily brakes ────────────────────────────────────────────
 

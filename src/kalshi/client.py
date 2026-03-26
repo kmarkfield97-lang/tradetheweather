@@ -120,9 +120,18 @@ class KalshiClient:
     # -------------------------------------------------------------------------
 
     def get_balance(self) -> float:
-        """Returns available balance in dollars."""
+        """Returns available cash balance in dollars."""
         data = self._get("/portfolio/balance")
         return data["balance"] / 100  # Kalshi returns cents
+
+    def get_portfolio_value(self) -> float:
+        """Returns total portfolio value (cash + open position value) in dollars."""
+        data = self._get("/portfolio/balance")
+        # Kalshi returns portfolio_value = cash + mark value of open positions.
+        # Fall back to cash-only balance if field is absent.
+        if "portfolio_value" in data:
+            return data["portfolio_value"] / 100
+        return data["balance"] / 100
 
     def get_positions(self) -> list[dict]:
         """Returns all open positions."""
