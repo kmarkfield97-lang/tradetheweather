@@ -37,6 +37,12 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "../../data")
 # ── Hard filter constants ──────────────────────────────────────────────────────
 MIN_HOURS_TO_CLOSE = 3      # skip markets closing in < 3 hours (unless high liquidity)
 MAX_HOURS_TO_CLOSE = 48     # skip markets > 48 hours out — NWS skill is negligible
+# Market types that must settle TODAY (UTC calendar date == today).
+# temp_high and temp_low scoring relies entirely on today's NWS forecast and
+# current station observations — applying that data to a tomorrow contract
+# produces the wrong signal direction and false edge.  Rain/snow are excluded
+# because storm-timing edge can extend beyond midnight.
+SAME_DAY_ONLY_MARKET_TYPES = frozenset({"temp_high", "temp_low"})
 MAX_SPREAD = 15             # maximum acceptable spread (cents)
 MAX_SPREAD_PCT = 0.25       # or 25% of contract price, whichever is more restrictive
 MIN_EXECUTABLE_LIQUIDITY = 25.0   # require $25 within 5¢ of mid price
@@ -1336,6 +1342,18 @@ class TradeAnalysisEngine:
                 if hours_left > MAX_HOURS_TO_CLOSE:
                     logger.debug(
                         f"REJECTED {ticker}: {hours_left:.1f}h to close > {MAX_HOURS_TO_CLOSE}h max"
+                    )
+                    return None
+
+                # Same-day settlement gate: temp_high and temp_low must settle
+                # today.  The NWS forecast pipeline only returns today's high/low;
+                # scoring a tomorrow contract against today's data produces wrong
+                # signals and false edge.  Rain/snow are exempt — storm timing
+                # edge can span midnight.
+                if market_type in SAME_DAY_ONLY_MARKET_TYPES and ct.date() != now_utc.date():
+                    logger.info(
+                        f"REJECTED {ticker}: {market_type} settles {ct.date()} (not today) "
+                        f"— same-day-only gate ({hours_left:.1f}h to close)"
                     )
                     return None
 
