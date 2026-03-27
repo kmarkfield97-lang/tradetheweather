@@ -5,6 +5,7 @@ Entry point. Run this to start the bot.
 import logging
 import asyncio
 import os
+import signal
 import sys
 
 from src.orchestrator import Orchestrator
@@ -17,32 +18,58 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-PID_FILE = os.path.join(os.path.dirname(__file__), "data", "bot.pid")
+# Use an absolute path derived from this file's real location so the lock path
+# is identical regardless of how the script is invoked (relative vs absolute,
+# launchd vs terminal). os.path.dirname(__file__) returns "" when invoked as
+# "python3 main.py", which resolved to a different CWD-relative path than the
+# launchd absolute-path invocation — allowing two instances to hold separate
+# "locks" on two different files simultaneously.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+PID_FILE = os.path.join(_HERE, "data", "bot.pid")
 
 
 def _acquire_pid_lock():
     """
-    Ensures only one instance runs at a time using an atomic file creation.
+    Ensures only one instance runs at a time using an atomic PID file.
     O_CREAT | O_EXCL guarantees only one process wins the race.
-    Falls back to checking for a stale PID if the file already exists.
+    Handles stale files left by SIGKILL or crash without finally: running.
     """
     while True:
         try:
-            # Atomic: fails immediately if file already exists
             fd = os.open(PID_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w") as f:
                 f.write(str(os.getpid()))
             return  # We hold the lock
         except FileExistsError:
-            # File exists — check if the owning process is still alive
             try:
                 with open(PID_FILE) as f:
-                    old_pid = int(f.read().strip())
-                os.kill(old_pid, 0)  # raises if process is gone
-                logger.error(f"Another bot instance is already running (PID {old_pid}). Exiting.")
+                    content = f.read().strip()
+                old_pid = int(content)
+                os.kill(old_pid, 0)  # raises ProcessLookupError if gone
+                # Process is alive — verify it's actually our bot, not a recycled PID
+                try:
+                    with open(f"/proc/{old_pid}/cmdline") as f:
+                        cmdline = f.read()
+                except FileNotFoundError:
+                    # macOS: use ps instead
+                    import subprocess
+                    result = subprocess.run(
+                        ["ps", "-p", str(old_pid), "-o", "command="],
+                        capture_output=True, text=True
+                    )
+                    cmdline = result.stdout
+                if "main.py" not in cmdline and "tradetheweather" not in cmdline:
+                    # PID was recycled by an unrelated process — treat as stale
+                    logger.warning(
+                        f"PID {old_pid} in lock file belongs to unrelated process "
+                        f"({cmdline.strip()!r}). Treating as stale."
+                    )
+                    raise ProcessLookupError
+                logger.error(
+                    f"Another bot instance is already running (PID {old_pid}). Exiting."
+                )
                 sys.exit(1)
-            except (ProcessLookupError, ValueError):
-                # Stale PID file — remove it and retry atomically
+            except (ProcessLookupError, ValueError, OSError):
                 logger.warning("Removing stale PID file and retrying.")
                 try:
                     os.remove(PID_FILE)
@@ -52,8 +79,13 @@ def _acquire_pid_lock():
 
 def _release_pid_lock():
     try:
-        os.remove(PID_FILE)
-    except FileNotFoundError:
+        # Only remove the file if it still contains our PID — don't clobber a
+        # lock that a new instance wrote after we were signalled.
+        with open(PID_FILE) as f:
+            pid_in_file = int(f.read().strip())
+        if pid_in_file == os.getpid():
+            os.remove(PID_FILE)
+    except (FileNotFoundError, ValueError, OSError):
         pass
 
 
