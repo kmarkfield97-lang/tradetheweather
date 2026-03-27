@@ -80,6 +80,16 @@ TRAILING_STOP_BANDS = [
     (90, 99, 0.05),   # peak 90¢+:    allow 5% giveback
 ]
 
+# ─── Adverse-excursion stop (NO positions) ───────────────────────────────────
+# For NO positions, the mark (YES price) can rise against us indefinitely while
+# the fair-value model continues to hold because hold_ev still slightly exceeds
+# exit_ev.  This stop adds a hard floor: if the YES price has risen more than
+# ADVERSE_STOP_PCT × entry_price above entry, exit regardless of hold_ev.
+# Example: entry_NO=26¢, ADVERSE_STOP_PCT=0.50 → exit when YES > 39¢.
+# Does NOT require a prior gain; arms immediately after entry.
+# Not gated by fair-value grace period (it is an emergency exit).
+ADVERSE_STOP_PCT = 0.50         # exit NO if mark > entry + 50% of entry (adverse move)
+
 # ─── Salvage stop (fail-safe only) ───────────────────────────────────────────
 SALVAGE_STOP_PCT = 0.35         # exit if mark < 35% of entry (unrecoverable)
 
@@ -136,6 +146,7 @@ EXIT_FAIR_VALUE          = "fair_value"
 EXIT_TRAILING_STOP       = "trailing_stop"
 EXIT_STAGED_PROFIT       = "staged_profit"
 EXIT_SALVAGE             = "salvage"
+EXIT_ADVERSE_STOP        = "adverse_excursion_stop"  # NO position moved too far against entry
 EXIT_DAILY_HALT          = "daily_halt"
 EXIT_EXPIRED             = "expired"
 EXIT_STALLED             = "stalled_capital_trap"  # position is a capital trap with no catalyst
@@ -1398,6 +1409,24 @@ class PnLTracker:
                 if floor is not None and mark < floor:
                     exit_contracts = remaining
                     exit_reason = EXIT_TRAILING_STOP
+
+            # ── Priority 4.5: Adverse-excursion stop (NO positions only) ──────
+            # The trailing stop only arms after a gain; it never fires on a
+            # losing NO position.  This fills the gap: if YES has risen more
+            # than ADVERSE_STOP_PCT × entry_NO above our entry, the market is
+            # moving against the thesis and we cut the loss before it compounds.
+            # Not gated by the fair-value grace period (emergency exit).
+            if exit_contracts == 0 and pos.side == "no":
+                adverse_threshold = pos.entry_price + round(pos.entry_price * ADVERSE_STOP_PCT)
+                if mark >= adverse_threshold:
+                    exit_contracts = remaining
+                    exit_reason = EXIT_ADVERSE_STOP
+                    logger.warning(
+                        f"ADVERSE_STOP {pos.ticker} NO | "
+                        f"entry={pos.entry_price}¢ mark={mark}¢ "
+                        f"threshold={adverse_threshold}¢ "
+                        f"(entry + {ADVERSE_STOP_PCT:.0%}) — cutting adverse position"
+                    )
 
             # ── Priority 5: Fair-value exit ───────────────────────────────────
             # Suppress for FAIR_VALUE_GRACE_MINUTES after entry: hold_ev is

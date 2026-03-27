@@ -678,15 +678,16 @@ def derive_structured_lesson(position: dict) -> StructuredLesson:
 # ── Exit reason normalisation (local to classifier) ───────────────────────────
 # Mirrors the one in history.py but kept here to avoid a circular import.
 _LESSON_EXIT_PREFIXES = [
-    ("thesis_invalidat", "thesis_invalidation"),
-    ("staged_profit",    "staged_profit"),
-    ("trailing_stop",    "trailing_stop"),
-    ("fair_value",       "fair_value"),
-    ("salvage_stop",     "salvage"),
-    ("daily_brake",      "daily_halt"),
-    ("daily_halt",       "daily_halt"),
-    ("stalled_capital",  "stalled_capital_trap"),   # EXIT_STALLED = "stalled_capital_trap"
-    ("expired",          "expired"),
+    ("thesis_invalidat",     "thesis_invalidation"),
+    ("staged_profit",        "staged_profit"),
+    ("trailing_stop",        "trailing_stop"),
+    ("fair_value",           "fair_value"),
+    ("salvage_stop",         "salvage"),
+    ("adverse_excursion",    "adverse_excursion_stop"),  # EXIT_ADVERSE_STOP
+    ("daily_brake",          "daily_halt"),
+    ("daily_halt",           "daily_halt"),
+    ("stalled_capital",      "stalled_capital_trap"),   # EXIT_STALLED = "stalled_capital_trap"
+    ("expired",              "expired"),
 ]
 
 

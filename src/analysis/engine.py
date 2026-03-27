@@ -36,7 +36,9 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "../../data")
 
 # ── Hard filter constants ──────────────────────────────────────────────────────
 MIN_HOURS_TO_CLOSE = 3      # skip markets closing in < 3 hours (unless high liquidity)
-MAX_HOURS_TO_CLOSE = 48     # skip markets > 48 hours out — NWS skill is negligible
+MAX_HOURS_TO_CLOSE = 28     # skip markets > 28 hours out — NWS skill is negligible beyond ~1 day
+# Rationale: 30–40h trades have 12% win rate vs 34% for 20–25h trades. Forecast uncertainty
+# at >28h is too high for temp_high/temp_low edge to be real.  Previously 48h.
 # Market types that must settle TODAY (UTC calendar date == today).
 # temp_high and temp_low scoring relies entirely on today's NWS forecast and
 # current station observations — applying that data to a tomorrow contract
@@ -48,6 +50,33 @@ MAX_SPREAD_PCT = 0.25       # or 25% of contract price, whichever is more restri
 MIN_EXECUTABLE_LIQUIDITY = 25.0   # require $25 within 5¢ of mid price
 MIN_PRICE_CENTS = 15        # skip markets priced below 15¢ (near-certain outcomes)
 MIN_PRICE_CENTS_HIGH_EDGE = 10    # allow down to 10¢ if edge is extremely large (>20¢)
+
+# ── Minimum model probability floor ───────────────────────────────────────────
+# When our model assigns a YES probability below this floor the estimate is
+# driven almost entirely by station-bias corrections rather than real signal.
+# Empirically, our_prob < 0.04 trades have a 22% win rate vs 62% for 0.15–0.30.
+# At extreme low probabilities the model is overconfident and the market is right.
+MIN_OUR_PROB = 0.04         # reject if our model says YES prob < 4%
+
+# ── Weak-signal NO gate (25–40¢ entry, low model prob) ────────────────────────
+# NO trades entered at 25–40¢ (market says 60–75% chance of NO) with
+# our_prob < 0.15 have a 0% win rate and account for -$12 of losses.
+# The market at these prices is reflecting genuine uncertainty that the model
+# is dismissing due to biased signal inputs.  Require strong model conviction
+# (our_prob < WEAK_NO_PROB_MAX) before entering this price zone.
+WEAK_NO_ENTRY_MIN_CENTS = 25   # entry price lower bound of danger zone (¢)
+WEAK_NO_ENTRY_MAX_CENTS = 40   # entry price upper bound of danger zone (¢)
+WEAK_NO_PROB_MAX        = 0.15 # block NO entry in zone if our_prob > this (market may be right)
+WEAK_NO_EDGE_FLOOR      = 0.50 # require edge ≥ 50¢ to override the block (near-impossible, acts as hard block)
+
+# ── High-edge / extreme-low-prob distrust gate ────────────────────────────────
+# When our_prob < EXTREME_LOW_PROB_THRESHOLD and edge is large, the edge is
+# driven entirely by model confidence in a very low probability — not by a
+# genuine market mispricing.  The model's extreme outputs (our_prob ≈ 1–2%)
+# are not calibrated enough to trust at high position sizes.
+# Apply a hard size cap instead of a full block.
+EXTREME_LOW_PROB_THRESHOLD = 0.05  # our_prob below this → apply size cap
+EXTREME_LOW_PROB_MAX_DOLLARS = 1.50  # max dollars when in extreme-low-prob territory
 MAX_TRADES_PER_DAY = 15  # hard cap: only take the top 15 highest-conviction trades per day
 # Trades ranked above this threshold face tighter quality checks (see _passes_extended_quality_gate).
 EXTENDED_QUALITY_RANK_THRESHOLD = 10  # ranks 11–15 are subject to extended gates
@@ -1643,6 +1672,22 @@ class TradeAnalysisEngine:
         )
         our_prob = max(0.01, min(0.99, base_prob + adj))
 
+        # ── Minimum model probability floor ────────────────────────────────────
+        # When the model assigns <4% YES probability the estimate is driven almost
+        # entirely by station-bias corrections, not real weather signal.
+        # Empirically these trades have a 22% win rate — no edge over random.
+        if our_prob < MIN_OUR_PROB:
+            logger.warning(
+                f"REJECTED {ticker}: our_prob={our_prob:.3f} < MIN_OUR_PROB={MIN_OUR_PROB:.2f} "
+                f"— model estimate at extreme is unreliable (bias-dominated)"
+            )
+            self._record_missed_opportunity(
+                ticker=ticker, city=city, market_type=market_type,
+                rejection_reason=f"extreme_low_prob(our_prob={our_prob:.3f})",
+                our_prob=our_prob, market_price_cents=price, edge_cents=0,
+            )
+            return None
+
         # Recompute edge with adjusted probability
         if side == "yes":
             edge = our_prob - market_yes_prob
@@ -1815,6 +1860,27 @@ class TradeAnalysisEngine:
                 )
                 return None
 
+        # ── Weak-signal NO gate (entry 25–40¢, low model prob) ────────────────
+        # At these prices the market is saying there is a 60–75% chance of NO,
+        # but we want even more certainty.  When our model's YES probability is
+        # above WEAK_NO_PROB_MAX (≥15%), the model is insufficiently confident
+        # to override the market — empirically these trades have a 0% win rate.
+        if (side == "no"
+                and WEAK_NO_ENTRY_MIN_CENTS <= price <= WEAK_NO_ENTRY_MAX_CENTS
+                and our_prob > WEAK_NO_PROB_MAX):
+            logger.warning(
+                f"REJECTED {ticker}: weak_no_gate | "
+                f"NO entry at {price}¢ but our_prob={our_prob:.3f} > {WEAK_NO_PROB_MAX:.2f} "
+                f"— model not convinced enough to fight market in 25–40¢ zone "
+                f"(0% win rate historically)"
+            )
+            self._record_missed_opportunity(
+                ticker=ticker, city=city, market_type=market_type,
+                rejection_reason=f"weak_no_gate(price={price},our_prob={our_prob:.3f})",
+                our_prob=our_prob, market_price_cents=price, edge_cents=edge * 100,
+            )
+            return None
+
         if edge < min_edge_req:
             gap = min_edge_req - edge
             rejection_reason = (
@@ -1939,6 +2005,19 @@ class TradeAnalysisEngine:
         min_position = max(0.10, daily_budget * 0.01)
         position_dollars = min(position_dollars, max_position)
         position_dollars = max(min_position, round(position_dollars, 2))
+
+        # ── Extreme-low-prob size cap ──────────────────────────────────────────
+        # When our_prob < EXTREME_LOW_PROB_THRESHOLD the model's extreme output is
+        # driven by uncalibrated bias corrections, not genuine signal.  We still
+        # allow the trade (it passed all gates) but cap the dollar risk so a wrong
+        # call cannot cause outsized losses — the PHIL -$8.82 trade had 14 contracts.
+        if our_prob < EXTREME_LOW_PROB_THRESHOLD and position_dollars > EXTREME_LOW_PROB_MAX_DOLLARS:
+            logger.info(
+                f"{ticker}: extreme_low_prob size cap — our_prob={our_prob:.3f} "
+                f"< {EXTREME_LOW_PROB_THRESHOLD:.2f}, capping ${position_dollars:.2f} "
+                f"→ ${EXTREME_LOW_PROB_MAX_DOLLARS:.2f}"
+            )
+            position_dollars = EXTREME_LOW_PROB_MAX_DOLLARS
 
         contracts = math.floor(position_dollars / (price / 100))
         if contracts < 1:
