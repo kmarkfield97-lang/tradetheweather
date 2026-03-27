@@ -121,12 +121,13 @@ class Orchestrator:
             name="End-of-day close",
         )
 
-        # Midnight reset at 12:01am PT
+        # Midnight reset at 12:05am PT — delayed from 12:01 to give Kalshi's
+        # settlement pipeline time to post proceeds before we snapshot starting_balance.
         self.scheduler.add_job(
             self._midnight_reset_job,
             "cron",
             hour=0,
-            minute=1,
+            minute=5,
             timezone="America/Los_Angeles",
             id="midnight_reset",
             name="Midnight reset",

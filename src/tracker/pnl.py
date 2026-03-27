@@ -777,6 +777,17 @@ class PnLTracker:
                 state_data = {k: v for k, v in data.items() if k in known_state and k != "positions"}
                 return DailyState(**state_data, positions=positions)
         starting_balance = self._fetch_portfolio_value()
+        # Kalshi's portfolio_value field can lag at midnight while settlement
+        # proceeds are posting.  If the value looks implausibly low, wait and retry.
+        if starting_balance < 5.0:
+            import time as _time
+            logger.warning(
+                f"Starting balance ${starting_balance:.2f} looks implausibly low — "
+                f"waiting 30s for settlement to post, then retrying"
+            )
+            _time.sleep(30)
+            starting_balance = self._fetch_portfolio_value()
+            logger.info(f"Retry starting balance: ${starting_balance:.2f}")
         state = DailyState(
             date=today,
             starting_balance=starting_balance,

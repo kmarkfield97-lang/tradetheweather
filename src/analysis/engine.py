@@ -1379,9 +1379,18 @@ class TradeAnalysisEngine:
                 # scoring a tomorrow contract against today's data produces wrong
                 # signals and false edge.  Rain/snow are exempt — storm timing
                 # edge can span midnight.
-                if market_type in SAME_DAY_ONLY_MARKET_TYPES and ct.date() != now_utc.date():
+                # NOTE: Kalshi markets close ~1h after local midnight (to allow the
+                # official observation to post), so ct.date() in UTC is always
+                # "tomorrow" even for same-day markets.  We compare using a fixed
+                # UTC-9 offset (covers all CONUS cities even in standard time) to
+                # determine the "today" reference date.  Any market whose close falls
+                # more than ~26h out is already blocked by MAX_HOURS_TO_CLOSE (28h).
+                _ref_tz = timezone(timedelta(hours=-9))  # UTC-9 covers all CONUS
+                _ct_ref_date = ct.astimezone(_ref_tz).date()
+                _now_ref_date = now_utc.astimezone(_ref_tz).date()
+                if market_type in SAME_DAY_ONLY_MARKET_TYPES and _ct_ref_date != _now_ref_date:
                     logger.info(
-                        f"REJECTED {ticker}: {market_type} settles {ct.date()} (not today) "
+                        f"REJECTED {ticker}: {market_type} settles {_ct_ref_date} (not today) "
                         f"— same-day-only gate ({hours_left:.1f}h to close)"
                     )
                     return None
@@ -1389,7 +1398,7 @@ class TradeAnalysisEngine:
                 # Pre-report same-day check (without observation data).
                 # If it rejects, we defer final decision until after the report is fetched
                 # so station-edge exceptions (obs already past threshold) can override.
-                if ct.date() == now_utc.date():
+                if _ct_ref_date == _now_ref_date:
                     _is_same_day = True
                     should_reject, cutoff_reason = self._same_day_cutoff_check(
                         city, market_type, threshold, hours_left, None
